@@ -35,8 +35,10 @@ This project is a fork of [dump1030 by Fuziih](https://github.com/Fuziih/dump103
 
 ```bash
 apt update && apt install -y build-essential pkg-config librtlsdr-dev
-git clone <this-repository>
+git clone https://github.com/davidkirberich/dump1030.git
+cd dump1030
 make
+chmod +x dump1030
 ```
 
 *(Note: Ensure the `Makefile` produces the binary named `dump1030`.)*
