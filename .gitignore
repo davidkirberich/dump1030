@@ -1,0 +1,13 @@
+dump1030
+*.o
+*.log
+*.beast
+dump.txt
+*.bin
+*.truth
+chan.txt
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
