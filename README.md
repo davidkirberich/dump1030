@@ -163,6 +163,24 @@ storing raw I/Q data.
 
 ## Tools
 
+### `monitor_p6.py` Live ICAO Monitor
+
+![Screenshot of monitor_p6.py in action](img/monitor_p6.png)
+
+`monitor_p6.py` follows JSONL output independently from `dump1030`. It aggregates
+confirmed ICAO addresses and does not modify or control the recording process:
+
+```bash
+python3 monitor_p6.py 'captured/events_*.jsonl'
+```
+
+By default it follows `captured/events_*.jsonl`. The curses interface updates
+in place and supports `j`/`k` or arrow-key selection, `/` for filtering, `c` to
+clear the filter, and Space or `p` to pause the display while copying text.
+Use `:q` or `Ctrl+C` to quit, or `:w [path]` to export the current view as TSV.
+The values `000000` and `FFFFFF` are omitted because they are not usable
+aircraft addresses.
+
 ### `p6sim.py` Simulator & Channel Estimator
 
 `p6sim.py` is a companion Python tool for testing and channel calibration:
