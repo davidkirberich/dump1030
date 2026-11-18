@@ -978,13 +978,37 @@ static uint32_t crc24Bits(const uint8_t* b, int nData)
     return reg & 0xFFFFFF;
 }
 
+// Uplink-Adresscodierung umkehren: c = obere 24 Koeffizienten von A(x)*G(x)
+static uint32_t uplinkDecodeAddr(uint32_t c)
+{
+    constexpr uint32_t G = 0x1FFF409;
+    uint32_t a = 0;
+    for (int k = 23; k >= 0; --k) {
+        uint32_t bit = (c >> k) & 1;
+        for (int i = k + 1; i <= 23; ++i)
+            if ((a >> i) & 1) bit ^= (G >> (24 + k - i)) & 1;
+        a |= bit << k;
+    }
+    return a;
+}
+
+// Selbsttest mit den gemessenen Werten (einmal beim Start aufrufen)
+static bool uplinkAddrSelftest()
+{
+    bool ok = uplinkDecodeAddr(0xAAAC07) == 0xFFFFFF    // Broadcast
+           && uplinkDecodeAddr(0x7FFA56) == 0x4004FE    // MUK6977
+           && uplinkDecodeAddr(0xCBE372) == 0xAE1458;   // RCH313
+    if (!ok) fprintf(stderr, "WARNUNG: Uplink-Adress-Selbsttest fehlgeschlagen\n");
+    return ok;
+}
+
 // Zieladresse aus AP (UF0, UF16 ...): AP XOR CRC(Daten)
 static uint32_t apToAddress(const std::vector<uint8_t>& b)
 {
     int n = (int)b.size();
     uint32_t ap = 0;
     for (int i = n - 24; i < n; ++i) ap = (ap << 1) | b[i];
-    return crc24Bits(b.data(), n - 24) ^ ap;
+    return uplinkDecodeAddr(crc24Bits(b.data(), n - 24) ^ ap);
 }
 
 // Q aus Viterbi-Metrik: 0,0 -> 255, 0,085 -> ~168, >= 0,25 -> 0
@@ -1200,17 +1224,18 @@ static void printUfFields(const UplinkResult &R) {
     uint32_t uf = bits(b, 1, 5);
     if ((uf >> 3) == 3) uf = 24;
     fprintf(G_txt, " UF=%u", uf);
-
     int exp = ufLength(uf);
     if (exp && exp != R.nbits)
         fprintf(G_txt, " [LAENGE? erwartet %d]", exp);
     if (R.viterbi)
         fprintf(G_txt, " AA=%06X%s", R.addr, R.addrCnt >= 2 ? " *" : " ?");
-
     switch (uf) {
     case 0: case 16:
         fprintf(G_txt, " RL=%u AQ=%u", bits(b, 9, 9), bits(b, 14, 14));
         if (uf == 0) fprintf(G_txt, " DS=0x%02X", bits(b, 15, 22));
+        // --- neu (Paket 5): MID = ICAO des sendenden TCAS ---
+        if (uf == 16 && R.nbits == 112)
+            fprintf(G_txt, " MID=%06X", bits(b, 65, 88));
         break;
     case 4: case 5: case 20: case 21:
         fprintf(G_txt, " PC=%u RR=%u DI=%u SD=0x%04X",
@@ -1229,10 +1254,9 @@ static void printUfFields(const UplinkResult &R) {
         break;
     default: break;
     }
-
     int nd = R.nbits - 24;
     uint32_t ap = bits(b, nd + 1, R.nbits);
-    fprintf(G_txt, " APx=%06X", ap ^ modesCrc(b, nd));
+    fprintf(G_txt, " APx=%06X", ap ^ modesCrc(b, nd));   // Rohwert (codiert)
 }
 
 static const char *beamClass(MsgCode c, int p1, int p2, double &db) {
@@ -1748,6 +1772,7 @@ for (int i = 1; i < argc; i++) {
         } else if (!strcmp(a, "--file")) {
             G.filename = needArg(argc, argv, i);
         } else if (!strcmp(a, "--chan")) {
+	    if (g_haveChan) uplinkAddrSelftest();
             g_haveChan = loadDpskChannel(needArg(argc, argv, i), g_chan);
         } else if (!strcmp(a, "--vcompare")) {
             vcompareLog = needArg(argc, argv, i);
