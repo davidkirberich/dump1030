@@ -162,6 +162,8 @@ struct UplinkResult {
     double  p6_cov = 0.0;        // Anteil Samples >= 0.4*P1 im P6-Fenster
     double  p6_min_ratio = 0.0;  // min(mag) / P1 im P6-Fenster
     double  p6_snr_db = 0.0;     // P6-Median relativ zum lokalen Rauschpegel
+    double  pre_snr_db = 0.0;    // P1 relativ zum lokalen Rauschpegel
+    double  p6_p1_ratio = 0.0;   // P6-Median relativ zur P1-Amplitude
     double  pre_rho = 0.0;       // normierte Praeambel-/SPR-Korrelation (0..1)
     const char *reject_reason = nullptr;
 };
@@ -326,13 +328,14 @@ static void writeJsonlP6(uint64_t smp, int p1, int p2, const UplinkResult& R) {
         "{\"type\":\"P6\",\"smp\":%llu,\"mono\":%.6f,\"uf\":%d,\"mode5\":%s,\"nbits\":%d,"
         "\"p1\":%d,\"p2\":%d,\"snr_db\":%.2f,\"df_hz\":%.1f,"
         "\"spr_us\":%.3f,\"lock\":%.3f,\"cov\":%.3f,\"p6min\":%.3f,"
-        "\"p6snr_db\":%.2f,\"rho\":%.3f,\"q\":%u,\"status\":\"%s\","
+        "\"p6snr_db\":%.2f,\"pre_snr_db\":%.2f,\"p6_p1_ratio\":%.2f,"
+        "\"rho\":%.3f,\"q\":%u,\"status\":\"%s\","
         "\"aa\":%s,\"aa_cnt\":%u,\"hex\":\"%s\"}\n",
         (unsigned long long)smp, monotonicSec(),
         (int)ufOf(R.bytes), R.mode5 ? "true" : "false", R.nbits,
         p1, p2, snr_db, R.freq_off_hz,
-        R.spr_us, R.spr_score, R.p6_cov, R.p6_min_ratio, R.p6_snr_db, R.pre_rho,
-        (unsigned)R.quality, status, aa_json,
+        R.spr_us, R.spr_score, R.p6_cov, R.p6_min_ratio, R.p6_snr_db,
+        R.pre_snr_db, R.p6_p1_ratio, R.pre_rho, (unsigned)R.quality, status, aa_json,
         (!R.mode5 && R.has_addr) ? (unsigned)R.addrCnt : 0u, hex);
     fflush(G.jsonl_fp);
 }
@@ -362,13 +365,14 @@ static void writeJsonlP6Reject(uint64_t smp, int p1, int p2,
         "{\"type\":\"P6_REJECTED\",\"smp\":%llu,\"mono\":%.6f,"
         "\"reason\":\"%s\",\"uf\":%d,\"nbits\":%d,\"p1\":%d,\"p2\":%d,"
         "\"snr_db\":%.2f,\"df_hz\":%.1f,\"spr_us\":%.3f,\"lock\":%.3f,"
-        "\"cov\":%.3f,\"p6min\":%.3f,\"p6snr_db\":%.2f,\"rho\":%.3f,"
+        "\"cov\":%.3f,\"p6min\":%.3f,\"p6snr_db\":%.2f,"
+        "\"pre_snr_db\":%.2f,\"p6_p1_ratio\":%.2f,\"rho\":%.3f,"
         "\"q\":%u,\"hex\":\"%s\"}\n",
         (unsigned long long)smp, monotonicSec(),
         R.reject_reason ? R.reject_reason : "unknown",
         uf, R.nbits, p1, p2, snr_db, R.freq_off_hz, R.spr_us,
         R.spr_score, R.p6_cov, R.p6_min_ratio, R.p6_snr_db,
-        R.pre_rho, (unsigned)R.quality, hex);
+        R.pre_snr_db, R.p6_p1_ratio, R.pre_rho, (unsigned)R.quality, hex);
     fflush(G.jsonl_fp);
 }
 
@@ -703,8 +707,10 @@ static int estimateLength(int i, int p1_ref) {
 }
 
 static const double WEAK_MARGIN = 0.3;
-static constexpr int MIN_VITERBI_QUALITY = 120;
+static constexpr int MIN_VITERBI_QUALITY = 160;
 static constexpr double MIN_P6_SNR_DB = 6.0;
+static constexpr double MIN_PREAMBLE_SNR_DB = 3.0;
+static constexpr double MAX_P6_TO_P1_RATIO = 4.0;
 
 // ===================== Viterbi-DPSK (Paket 1) =====================
 // Zeitachse wie p6sim: 20-MS/s-Index, P1-Vorderflanke = 160, Datenchip j ab anchor + 5*j
@@ -1169,7 +1175,8 @@ static double medianMagnitude(int i, double t0_us, double t1_us) {
 }
 
 static void evalP6Envelope(int i, int p1_ref, int nbits,
-                           double &cov, double &min_ratio, double &snr_db) {
+                           double &cov, double &min_ratio, double &snr_db,
+                           double &pre_snr_db, double &p6_p1_ratio) {
     const Timing &T = G.tm;
     double t1_us = (nbits == 112) ? 33.0 : 19.0;
     int a = i + (int)std::ceil(T.f(4.0));
@@ -1178,6 +1185,8 @@ static void evalP6Envelope(int i, int p1_ref, int nbits,
         cov = 0.0;
         min_ratio = 0.0;
         snr_db = -999.0;
+        pre_snr_db = -999.0;
+        p6_p1_ratio = 0.0;
         return;
     }
     int min_v = 255, above = 0, total = b - a + 1;
@@ -1196,6 +1205,8 @@ static void evalP6Envelope(int i, int p1_ref, int nbits,
     double noise2 = medianMagnitude(i, end_us + 0.5, end_us + 1.8);
     double noise = std::max(1.0, std::max(noise1, noise2));
     snr_db = 20.0 * std::log10(std::max(1.0, signal) / noise);
+    pre_snr_db = 20.0 * std::log10((double)p1_ref / noise);
+    p6_p1_ratio = std::max(1.0, signal) / p1_ref;
 }
 
 static bool validUplinkFormat(const uint8_t *b, int nbits) {
@@ -1223,13 +1234,22 @@ static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
         R.reject_reason = "length";
         return R;
     }
-    evalP6Envelope(i, p1_ref, nbits, R.p6_cov, R.p6_min_ratio, R.p6_snr_db);
+    evalP6Envelope(i, p1_ref, nbits, R.p6_cov, R.p6_min_ratio, R.p6_snr_db,
+                   R.pre_snr_db, R.p6_p1_ratio);
     if (R.p6_cov < 0.65) {
         R.reject_reason = "p6_coverage";
         return R;
     }
     if (R.p6_snr_db < MIN_P6_SNR_DB) {
         R.reject_reason = "p6_snr";
+        return R;
+    }
+    if (R.pre_snr_db < MIN_PREAMBLE_SNR_DB) {
+        R.reject_reason = "preamble_snr";
+        return R;
+    }
+    if (R.p6_p1_ratio > MAX_P6_TO_P1_RATIO) {
+        R.reject_reason = "p6_p1_ratio";
         return R;
     }
 
@@ -1303,13 +1323,22 @@ static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
         UplinkResult R2 = R;
         if (demodBits(i, L, fe.w, 112, R2)) {
             R = R2;
-            evalP6Envelope(i, p1_ref, 112, R.p6_cov, R.p6_min_ratio, R.p6_snr_db);
+            evalP6Envelope(i, p1_ref, 112, R.p6_cov, R.p6_min_ratio, R.p6_snr_db,
+                           R.pre_snr_db, R.p6_p1_ratio);
             if (R.p6_cov < 0.65) {
                 R.reject_reason = "p6_coverage";
                 return R;
             }
             if (R.p6_snr_db < MIN_P6_SNR_DB) {
                 R.reject_reason = "p6_snr";
+                return R;
+            }
+            if (R.pre_snr_db < MIN_PREAMBLE_SNR_DB) {
+                R.reject_reason = "preamble_snr";
+                return R;
+            }
+            if (R.p6_p1_ratio > MAX_P6_TO_P1_RATIO) {
+                R.reject_reason = "p6_p1_ratio";
                 return R;
             }
         }
