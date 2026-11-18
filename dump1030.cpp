@@ -1560,83 +1560,19 @@ struct PendingP6 {
     int          show = 0;
 };
 
-struct SyncSlot {
-    uint64_t phase = 0;
-    uint64_t last_pos = 0;
-};
-
 struct EmitterContext {
     std::vector<PendingP6> train;
-    std::vector<SyncSlot>  mode5_slots;
     uint64_t               last_pos = 0;
 };
 static EmitterContext g_emitCtx;
 
-static bool matchesMode5SyncSlot(uint64_t pos) {
-    uint64_t rate    = G.samplerate;
-    uint64_t max_age = 15ULL * rate;
-    uint64_t tol     = rate / 40; // +/- 25 ms
-    uint64_t phase   = pos % rate;
-
-    auto &slots = g_emitCtx.mode5_slots;
-    slots.erase(std::remove_if(slots.begin(), slots.end(), [&](const SyncSlot &s) {
-        return pos > s.last_pos && (pos - s.last_pos) > max_age;
-    }), slots.end());
-
-    for (const auto &s : slots) {
-        uint64_t d = (phase >= s.phase) ? (phase - s.phase) : (s.phase - phase);
-        if (d > rate / 2) d = rate - d;
-        if (d <= tol) return true;
-    }
-    return false;
-}
-
-static void recordMode5SyncSlot(uint64_t pos) {
-    uint64_t rate  = G.samplerate;
-    uint64_t tol   = rate / 40;
-    uint64_t phase = pos % rate;
-
-    for (auto &s : g_emitCtx.mode5_slots) {
-        uint64_t d = (phase >= s.phase) ? (phase - s.phase) : (s.phase - phase);
-        if (d > rate / 2) d = rate - d;
-        if (d <= tol) {
-            s.phase    = phase;
-            s.last_pos = pos;
-            return;
-        }
-    }
-    if (g_emitCtx.mode5_slots.size() >= 64)
-        g_emitCtx.mode5_slots.erase(g_emitCtx.mode5_slots.begin());
-    g_emitCtx.mode5_slots.push_back({phase, pos});
-}
-
 static void flushEmitterTrain() {
     if (g_emitCtx.train.empty()) return;
 
-    bool explicit_mode5 = false;
-    for (const auto &ev : g_emitCtx.train) {
-        uint32_t uf = ufOf(ev.R.bytes);
-        if (isMode5Format(ev.R.bytes, ev.R.nbits) || (uf == 0 && ev.p2 > ev.p1)) {
-            explicit_mode5 = true;
-            break;
-        }
-    }
-
-    uint64_t first_pos = g_emitCtx.train.front().pos;
-    uint64_t last_pos  = g_emitCtx.train.back().pos;
-    bool train_mode5   = explicit_mode5
-                      || matchesMode5SyncSlot(first_pos)
-                      || matchesMode5SyncSlot(last_pos);
-
-    if (explicit_mode5) {
-        recordMode5SyncSlot(first_pos);
-        if (last_pos != first_pos) recordMode5SyncSlot(last_pos);
-    }
-
     for (auto &ev : g_emitCtx.train) {
         uint32_t uf = ufOf(ev.R.bytes);
-        ev.R.mode5 = train_mode5;
-        if (train_mode5) {
+        ev.R.mode5 = isMode5Format(ev.R.bytes, ev.R.nbits);
+        if (ev.R.mode5) {
             ev.R.has_addr = false;
             ev.R.addr     = 0;
             ev.R.addrCnt  = 0;

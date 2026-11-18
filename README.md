@@ -121,6 +121,9 @@ P6 JSONL output includes `status` (`candidate`, `confirmed`, or `mode5`),
 `p6snr_db`, `pre_snr_db`, and `p6_p1_ratio`. An
 unconfirmed address is represented by `"aa":null` together with its
 `aa_cnt`; it is not an externally verified aircraft identification.
+Mode-5 classification is determined independently for each decoded payload;
+neighboring interrogations cannot suppress an ICAO address by sharing a time
+slot with a Mode-5 message.
 
 With `--p6-diagnostics`, rejected candidates are additionally written as
 `type:"P6_REJECTED"`. The `reason` identifies the first failed gate, for
