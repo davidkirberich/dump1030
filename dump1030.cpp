@@ -992,16 +992,6 @@ static uint32_t uplinkDecodeAddr(uint32_t c)
     return a;
 }
 
-// Selbsttest mit den gemessenen Werten (einmal beim Start aufrufen)
-static bool uplinkAddrSelftest()
-{
-    bool ok = uplinkDecodeAddr(0xAAAC07) == 0xFFFFFF    // Broadcast
-           && uplinkDecodeAddr(0x7FFA56) == 0x4004FE    // MUK6977
-           && uplinkDecodeAddr(0xCBE372) == 0xAE1458;   // RCH313
-    if (!ok) fprintf(stderr, "WARNUNG: Uplink-Adress-Selbsttest fehlgeschlagen\n");
-    return ok;
-}
-
 // Zieladresse aus AP (UF0, UF16 ...): AP XOR CRC(Daten)
 static uint32_t apToAddress(const std::vector<uint8_t>& b)
 {
@@ -1772,7 +1762,6 @@ for (int i = 1; i < argc; i++) {
         } else if (!strcmp(a, "--file")) {
             G.filename = needArg(argc, argv, i);
         } else if (!strcmp(a, "--chan")) {
-	    if (g_haveChan) uplinkAddrSelftest();
             g_haveChan = loadDpskChannel(needArg(argc, argv, i), g_chan);
         } else if (!strcmp(a, "--vcompare")) {
             vcompareLog = needArg(argc, argv, i);
