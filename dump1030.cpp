@@ -707,7 +707,7 @@ static int estimateLength(int i, int p1_ref) {
 }
 
 static const double WEAK_MARGIN = 0.3;
-static constexpr int MIN_VITERBI_QUALITY = 160;
+static constexpr int MIN_VITERBI_QUALITY = 180;
 static constexpr double MIN_P6_SNR_DB = 6.0;
 static constexpr double MIN_PREAMBLE_SNR_DB = 3.0;
 static constexpr double MAX_P6_TO_P1_RATIO = 4.0;
@@ -1269,6 +1269,11 @@ static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
             R.quality     = (uint8_t)dpskQuality(br.v.metric);
             R.pre_rho     = br.rho;
 
+            memset(R.bytes, 0, sizeof(R.bytes));
+            for (int b = 0; b < nbits; ++b) {
+                if (br.v.bits[b]) R.bytes[b / 8] |= (uint8_t)(0x80 >> (b % 8));
+            }
+
             if (R.pre_rho < 0.50) {
                 R.reject_reason = "preamble_rho";
                 return R;
@@ -1282,10 +1287,6 @@ static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
                 return R;
             }
 
-            memset(R.bytes, 0, sizeof(R.bytes));
-            for (int b = 0; b < nbits; ++b) {
-                if (br.v.bits[b]) R.bytes[b / 8] |= (uint8_t)(0x80 >> (b % 8));
-            }
             if (!validUplinkFormat(R.bytes, R.nbits)) {
                 R.reject_reason = "uplink_format";
                 return R;

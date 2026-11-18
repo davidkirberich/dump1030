@@ -16,7 +16,7 @@ This project is a fork of [dump1030 by Fuziih](https://github.com/Fuziih/dump103
 - **Mode S P6 demodulator:** Sync Phase Reversal (SPR) lock, automatic frame length estimation (56/112 bits), per-frame carrier frequency offset estimation, and `--ppm` tuner correction.
 - **Viterbi / MLSE DPSK decoder:** A 64-state Maximum-Likelihood Sequence Estimator operating on a blindly learned receiver impulse response. Read chapter "**Why a Viterbi Decoder?**" for more information.
 - **Target ICAO address recovery:** Extracts the 24-bit aircraft address (`AA`) via $\text{AA} = \text{AP} \oplus \text{CRC}_{24}(\text{data})$ for UF0, UF16, and related formats.
-- **Conservative P6 acceptance:** Requires a valid uplink format and length, a sufficiently strong and preamble-consistent continuous P6 envelope, and a quality threshold of 160 for Viterbi-decoded frames.
+- **Conservative P6 acceptance:** Requires a valid uplink format and length, a sufficiently strong and preamble-consistent continuous P6 envelope, and a quality threshold of 180 for Viterbi-decoded frames.
 - **Explicit event status:** JSONL events distinguish `candidate`, `confirmed`, and `mode5`. `aa` remains `null` until the same target address has been seen twice.
 - **Optional P6 diagnostics:** `--p6-diagnostics` records rejected P6 candidates as `P6_REJECTED` JSONL events with the failed acceptance gate and all available metrics.
 - **Temporal address confirmation:** Marks an aircraft address as confirmed (`*`) once it is observed at least twice with no gap longer than 60 seconds between sightings.
