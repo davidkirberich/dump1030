@@ -194,6 +194,9 @@ struct UplinkResult {
     double  freq_off_hz = 0.0;   // geschaetzter Frequenzoffset
     uint8_t quality = 0;         // 0..255, kombiniert (fuer Beast)
     uint32_t addr = 0; int addrCnt = 0; bool viterbi = false;
+    double  p6_cov = 0.0;        // Anteil Samples >= 0.4*P1 im P6-Fenster
+    double  p6_min_ratio = 0.0;  // min(mag) / P1 im P6-Fenster
+    double  pre_rho = 0.0;       // normierte Praeambel-/SPR-Korrelation (0..1)
 };
 
 // ---------- Globaler Zustand ----------
@@ -852,6 +855,7 @@ struct BlindResult {
     double c = 0;                    // Modellzeit von r[0]
     float  phi = 0.f, A = 0.f;
     double dfHz = 0;
+    double rho = 0.0;
 };
 
 // wie rt_frame: Fenster holen, df schätzen und entfernen
@@ -877,18 +881,20 @@ static bool bdFrame(const uint8_t* iq, size_t nPairs, long k, int n,
 
 // wie st_pre_fit
 static bool bdPreFit(const DpskChannel& ch, const std::complex<float>* r, double c,
-                     std::complex<double>& num, double& den)
+                     std::complex<double>& num, double& den, double& sigEnergy)
 {
     double lim = ch.anchor + ch.delay - 10;
-    num = 0; den = 0;
+    num = 0; den = 0; sigEnergy = 0;
     for (int k = 0; k < BD_WIN; ++k) {
         double t = c + 8.0 * k;
         if (t >= lim) break;
         double kv = ch.knv(t);
-        num += std::complex<double>(r[k]) * kv;
+        std::complex<double> rk(r[k]);
+        num += rk * kv;
         den += kv * kv;
+        sigEnergy += std::norm(rk);
     }
-    return den > 0;
+    return den > 0 && sigEnergy > 0;
 }
 
 // wie st_blind_decode: Grobtiming per Präambel, Feintiming per Viterbi-Metrik
@@ -899,9 +905,9 @@ bool blindDecodeDpsk(const DpskChannel& ch, const uint8_t* iq, size_t nPairs,
     if (!bdFrame(iq, nPairs, k, n, r, out.dfHz)) return false;
 
     int bestC = 0; double bestS = -1;
-    std::complex<double> num; double den;
+    std::complex<double> num; double den, sigE;
     for (int c = -24; c <= 32; ++c)
-        if (bdPreFit(ch, r, c, num, den)) {
+        if (bdPreFit(ch, r, c, num, den, sigE)) {
             double s = std::norm(num) / den;
             if (s > bestS) { bestS = s; bestC = c; }
         }
@@ -909,11 +915,13 @@ bool blindDecodeDpsk(const DpskChannel& ch, const uint8_t* iq, size_t nPairs,
 
     bool have = false;
     for (int cc = bestC - 1; cc <= bestC + 1; ++cc) {
-        if (!bdPreFit(ch, r, cc, num, den)) continue;
+        if (!bdPreFit(ch, r, cc, num, den, sigE)) continue;
         float phi = (float)std::arg(num), A = (float)(std::abs(num) / den);
         ViterbiResult v = viterbiDpsk(ch, r, BD_WIN, cc, phi, A, n);
         if (!have || v.metric < out.v.metric) {
-            out.v = v; out.c = cc; out.phi = phi; out.A = A; have = true;
+            out.v = v; out.c = cc; out.phi = phi; out.A = A;
+            out.rho = std::norm(num) / (den * sigE);
+            have = true;
         }
     }
     return have;
@@ -1117,35 +1125,69 @@ static void collectStats(const UplinkResult &R) {
 
 static double g_spr_offset_us = 0.0;
 
+static void evalP6Envelope(int i, int p1_ref, int nbits,
+                           double &cov, double &min_ratio) {
+    const Timing &T = G.tm;
+    double t1_us = (nbits == 112) ? 33.0 : 19.0;
+    int a = i + (int)std::ceil(T.f(4.0));
+    int b = i + (int)std::floor(T.f(t1_us));
+    if (a < 0 || b >= (int)g_valid_samples || b < a || p1_ref <= 0) {
+        cov = 0.0;
+        min_ratio = 0.0;
+        return;
+    }
+    int min_v = 255, above = 0, total = b - a + 1;
+    double thresh = 0.4 * p1_ref;
+    for (int k = a; k <= b; ++k) {
+        int v = G.mag[k];
+        if (v < min_v) min_v = v;
+        if (v >= thresh) above++;
+    }
+    cov = (double)above / total;
+    min_ratio = (double)min_v / p1_ref;
+}
+
 static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
-    (void)p1_ref;
     UplinkResult R;
     if (nbits == 0) return R;
+    evalP6Envelope(i, p1_ref, nbits, R.p6_cov, R.p6_min_ratio);
+    if (R.p6_cov < 0.65) return R;
 
     // --- Viterbi-Pfad (Paket 4) ---
     if (g_haveChan) {
         BlindResult br;
         size_t nPairs = G.iq_hist.size() / 2;
         if (blindDecodeDpsk(g_chan, G.iq_hist.data(), nPairs, i, nbits, br)) {
+            double w_rad = br.dfHz * (2.0 * PI) / G.samplerate;
+            SprLock L = lockSpr(i, w_rad);
+            L.t_us += g_spr_offset_us;
+
+            R.nbits       = nbits;
+            R.spr_us      = L.t_us;
+            R.spr_score   = L.score;
+            R.freq_off_hz = br.dfHz;
+            R.quality     = (uint8_t)dpskQuality(br.v.metric);
+            R.pre_rho     = br.rho;
+
+            if (R.pre_rho < 0.50 || R.spr_score < 0.50 || R.quality < 80)
+                return R;
+
             memset(R.bytes, 0, sizeof(R.bytes));
             for (int b = 0; b < nbits; ++b) {
                 if (br.v.bits[b]) R.bytes[b / 8] |= (uint8_t)(0x80 >> (b % 8));
                 R.margin[b] = 1.0f;
             }
-            R.nbits       = nbits;
-            R.freq_off_hz = br.dfHz;
             R.mean_margin = 1.0;
             R.min_margin  = 1.0;
             R.weak_bits   = 0;
-            R.quality     = (uint8_t)dpskQuality(br.v.metric);
             R.addr        = apToAddress(br.v.bits);
             R.addrCnt     = g_addrTrack.seen(R.addr, (G.sample_base + (uint64_t)i) / (double)G.samplerate);
             R.viterbi     = true;
             collectStats(R);
             R.valid       = true;
             G.uplink_ok++;
-            return R;
         }
+        return R;
     }
 
     FreqEst fe = estimateFreqOffset(i);
@@ -1154,12 +1196,16 @@ static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
     R.spr_us      = L.t_us;
     R.spr_score   = L.score;
     R.freq_off_hz = fe.hz;
-    if (!L.ok) return R;
+    if (!L.ok || R.spr_score < 0.50) return R;
     if (!demodBits(i, L, fe.w, nbits, R)) return R;
 
     if (ufLength(ufOf(R.bytes)) == 112 && R.nbits == 56) {
         UplinkResult R2 = R;
-        if (demodBits(i, L, fe.w, 112, R2)) R = R2;
+        if (demodBits(i, L, fe.w, 112, R2)) {
+            R = R2;
+            evalP6Envelope(i, p1_ref, 112, R.p6_cov, R.p6_min_ratio);
+            if (R.p6_cov < 0.65) return UplinkResult{};
+        }
     }
 
     if (ufLength(ufOf(R.bytes)) == 0 && L.t_us > us::SPR_PRIOR + 0.25) {
@@ -1185,6 +1231,7 @@ static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
     }
 
     R.quality = combineQuality(R);
+    if (R.quality < 80) return R;
     collectStats(R);
     R.valid = true;
     if (R.weak_bits * 4 > R.nbits) G.uplink_weak++;
@@ -1298,9 +1345,11 @@ static void analyzeBurst(uint64_t pos, MsgCode code, const uint8_t *m,
 
     if (R && R->valid) {
         fprintf(G_txt, "\n  [P6] %d Bit spr=%.2f us lock=%.2f "
-                       "margin=%.2f/%.2f weak=%d df=%+.1f kHz Q=%u HEX=",
+                       "margin=%.2f/%.2f weak=%d df=%+.1f kHz Q=%u "
+                       "cov=%.2f p6min=%.2f rho=%.2f HEX=",
                 R->nbits, R->spr_us, R->spr_score, R->mean_margin,
-                R->min_margin, R->weak_bits, R->freq_off_hz / 1e3, R->quality);
+                R->min_margin, R->weak_bits, R->freq_off_hz / 1e3, R->quality,
+                R->p6_cov, R->p6_min_ratio, R->pre_rho);
         for (int k = 0; k < R->nbits / 8; k++) fprintf(G_txt, "%02X", R->bytes[k]);
         printUfFields(*R, pos);
     } else if (R && G.uplink_decode) {
