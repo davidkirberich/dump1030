@@ -16,8 +16,10 @@ This project is a fork of [dump1030 by Fuziih](https://github.com/Fuziih/dump103
 - **Mode S P6 demodulator:** Sync Phase Reversal (SPR) lock, automatic frame length estimation (56/112 bits), per-frame carrier frequency offset estimation, and `--ppm` tuner correction.
 - **Viterbi / MLSE DPSK decoder:** A 64-state Maximum-Likelihood Sequence Estimator operating on a blindly learned receiver impulse response. Read chapter "**Why a Viterbi Decoder?**" for more information.
 - **Target ICAO address recovery:** Extracts the 24-bit aircraft address (`AA`) via $\text{AA} = \text{AP} \oplus \text{CRC}_{24}(\text{data})$ for UF0, UF16, and related formats.
+- **Conservative P6 acceptance:** Requires a valid uplink format and length, a sufficiently strong continuous P6 envelope above the local noise median, and a quality threshold of 120 for Viterbi-decoded frames.
+- **Explicit event status:** JSONL events distinguish `candidate`, `confirmed`, and `mode5`. `aa` remains `null` until the same target address has been seen twice.
+- **Optional P6 diagnostics:** `--p6-diagnostics` records rejected P6 candidates as `P6_REJECTED` JSONL events with the failed acceptance gate and all available metrics.
 - **Temporal address confirmation:** Marks an aircraft address as confirmed (`*`) once it is observed at least twice with no gap longer than 60 seconds between sightings.
-- **Beast binary output:** Streams Mode A/C (`0x55`) and Mode S uplink (`0x56`) frames to a file, `stdout`, or over TCP.
 - **Simulation & analysis suite (`p6sim.py`):** Self-contained Python 3 tool (standard library only) for generating synthetic test signals, running decoder benchmarks, and learning the receiver channel response.
 
 ---
@@ -108,16 +110,23 @@ chmod +x dump1030
 --uplink-decode         Enable Mode S P6 (DPSK) uplink demodulation
 --chan <path>           Load learned receiver channel file (enables Viterbi decoder)
 --msgs                  Print decoded interrogations with sample details
+--p6-diagnostics        Write rejected P6 candidates to JSONL (requires --out-dir)
 ```
 
-### Beast Binary Output
+The blind channel model uses the 2.5 MS/s time grid learned by `p6sim.py`.
+`--chan` therefore requires `--samplerate 2.5` (the default); other sample
+rates are intentionally rejected for that decoder.
 
-Messages can be exported in Beast binary format (`0x55` = Mode A/C, `0x56` = Mode S uplink when `--uplink-decode` is enabled):
+P6 JSONL output includes `status` (`candidate`, `confirmed`, or `mode5`) and
+`p6snr_db`, the P6 envelope median relative to the local noise median. An
+unconfirmed address is represented by `"aa":null` together with its
+`aa_cnt`; it is not an externally verified aircraft identification.
 
-```text
---beast-out <path|->    Write Beast binary frames to a file or stdout ("-")
---net-beast-port <p>    Start a Beast TCP server on port <p> (standard port: 30005)
-```
+With `--p6-diagnostics`, rejected candidates are additionally written as
+`type:"P6_REJECTED"`. The `reason` identifies the first failed gate, for
+example `p6_snr`, `preamble_rho`, `spr_lock`, `viterbi_quality`, or
+`uplink_format`. This diagnostic stream makes gate tuning measurable without
+storing raw I/Q data.
 
 ### Debugging & Verification
 

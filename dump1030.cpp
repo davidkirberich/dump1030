@@ -2,38 +2,6 @@
 // Build: g++ -O2 -std=gnu++17 -Wall -Wextra -pthread \
 //   dump1030.cpp -lrtlsdr -o dump1030
 
-/* ================================================================
- * dump1030 Beast-Erweiterung, Layout-Version 1
- * ================================================================
- * Rahmen (wie Standard-Beast):
- *   0x1A  TYP  TS[6]  SIG  PAYLOAD[n]
- *   TS   : 12-MHz-Zaehler ab Programmstart, big endian
- *   SIG  : P1-Spitzenwert (Magnitude 0..255)
- *   Escaping: jedes 0x1A in TS/SIG/PAYLOAD wird als 0x1A 0x1A gesendet
- *
- * TYP 0x55  Pulsdetektion            n = 6
- *   [0] Version (=1)
- *   [1] MsgCode   3=S 11=A 12=C 21=A-ACAC 22=C-ACAC 31=A-ACSAC 32=C-ACSAC
- *   [2] BeamCode  0=MAIN 1=SLS 2=UNSICHER 3=MODE-S
- *   [3] P1-Peak   [4] P2-Peak
- *   [5] P1/P2 in 0,5 dB (int8)
- *
- * TYP 0x56  Mode-S-Uplink (P6)       n = 25
- *   [0]      Version (=1)
- *   [1]      Flags  b0=112 Bit  b1=Laengenkonflikt UF/P6  b2=>25% weak
- *   [2]      Quality 0..255
- *   [3]      SPR-Lock-Score * 255
- *   [4]      mittlerer Margin * 255
- *   [5]      minimaler Margin * 255
- *   [6]      Anzahl weak bits
- *   [7..8]   SPR-Zeitpunkt in ns nach P1 (uint16 BE)
- *   [9..10]  Frequenzoffset in 10 Hz (int16 BE)
- *   [11..24] 14 Datenbytes (56 Bit: nur [11..17] gueltig)
- *
- * Ein 0x56-Frame folgt immer direkt auf den 0x55-Frame desselben Bursts
- * (gleicher Zeitstempel). Standard-Tools ignorieren beide Typen.
- * ================================================================ */
-
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -49,15 +17,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
 #include <rtl-sdr.h>
-#include <sys/stat.h>
-#include <cerrno>
-#include <ctime>
 
 // ---------- Konstanten ----------
 static constexpr double PI           = 3.14159265358979323846;
@@ -73,9 +34,6 @@ static const int      MAX_GAIN       = 999999;
 // Laengster Zugriff: Mode S 112 Bit endet 33,75 us nach P1
 // -> 108 Samples bei 3,2 MS/s + Stuetzstellen der Interpolation.
 static const int      MAX_LOOKAHEAD      = 120;
-static const int      DEFAULT_BEAST_PORT = 30005;
-static const uint8_t  BEAST_TYPE_PULSE   = 0x55; // Pulsdetektion
-static const uint8_t  BEAST_TYPE_UPLINK  = 0x56; // Mode-S-Uplink (P6)
 
 // Zeitpunkte in us relativ zur Vorderflanke von P1 (ICAO Annex 10)
 namespace us {
@@ -96,7 +54,7 @@ namespace us {
     constexpr double P6_END112 = 3.5 + 30.25;
 }
 
-// Detektionscodes (identisch fuer --order und Beast-Payload Byte 1)
+// Detektionscodes (identisch fuer --order und JSONL-Ausgabe)
 enum MsgCode : uint8_t {
     MSG_NONE        = 0,
     MSG_S           = 3,   // Mode S (P1+P2)
@@ -195,7 +153,7 @@ struct UplinkResult {
     double  min_margin = 0.0;    // schlechteste Bitentscheidung
     int     weak_bits = 0;       // Bits mit |cos dphi| < 0,3
     double  freq_off_hz = 0.0;   // geschaetzter Frequenzoffset
-    uint8_t quality = 0;         // 0..255, kombiniert (fuer Beast)
+    uint8_t quality = 0;         // 0..255, kombiniert
     uint32_t addr = 0;
     int     addrCnt = 0;
     bool    has_addr = false;
@@ -203,7 +161,9 @@ struct UplinkResult {
     bool    viterbi = false;
     double  p6_cov = 0.0;        // Anteil Samples >= 0.4*P1 im P6-Fenster
     double  p6_min_ratio = 0.0;  // min(mag) / P1 im P6-Fenster
+    double  p6_snr_db = 0.0;     // P6-Median relativ zum lokalen Rauschpegel
     double  pre_rho = 0.0;       // normierte Praeambel-/SPR-Korrelation (0..1)
+    const char *reject_reason = nullptr;
 };
 
 // ---------- Globaler Zustand ----------
@@ -243,16 +203,8 @@ struct State {
     bool     baseline   = false;
     bool     continuous = false;
     bool     uplink_decode = false;
+    bool     p6_diagnostics = false;
     const char *filename = nullptr;
-
-    // Beast
-    const char *beast_file = nullptr;  // "-" = stdout
-    FILE       *beast_fp   = nullptr;
-    int         beast_port = 0;        // 0 = aus
-    int         listen_fd  = -1;
-    std::vector<int> clients;
-    pthread_mutex_t  net_mutex = PTHREAD_MUTEX_INITIALIZER;
-    pthread_t        net_thread{};
 
     // Statistik
     Counters cur, cum;
@@ -367,16 +319,21 @@ static void writeJsonlP6(uint64_t smp, int p1, int p2, const UplinkResult& R) {
 
     double snr_db = (p2 > 0 && p1 > 0) ? 20.0 * log10((double)p1 / (double)p2) : 0.0;
 
+    const char *status = R.mode5 ? "mode5"
+                       : (R.has_addr && R.addrCnt >= 2) ? "confirmed" : "candidate";
+
     fprintf(G.jsonl_fp,
         "{\"type\":\"P6\",\"smp\":%llu,\"mono\":%.6f,\"uf\":%d,\"mode5\":%s,\"nbits\":%d,"
         "\"p1\":%d,\"p2\":%d,\"snr_db\":%.2f,\"df_hz\":%.1f,"
-        "\"spr_us\":%.3f,\"lock\":%.3f,\"cov\":%.3f,\"p6min\":%.3f,\"rho\":%.3f,"
-        "\"q\":%u,\"aa\":%s,\"aa_cnt\":%u,\"hex\":\"%s\"}\n",
+        "\"spr_us\":%.3f,\"lock\":%.3f,\"cov\":%.3f,\"p6min\":%.3f,"
+        "\"p6snr_db\":%.2f,\"rho\":%.3f,\"q\":%u,\"status\":\"%s\","
+        "\"aa\":%s,\"aa_cnt\":%u,\"hex\":\"%s\"}\n",
         (unsigned long long)smp, monotonicSec(),
         (int)ufOf(R.bytes), R.mode5 ? "true" : "false", R.nbits,
         p1, p2, snr_db, R.freq_off_hz,
-        R.spr_us, R.spr_score, R.p6_cov, R.p6_min_ratio, R.pre_rho,
-        (unsigned)R.quality, aa_json, (!R.mode5 && R.has_addr) ? (unsigned)R.addrCnt : 0u, hex);
+        R.spr_us, R.spr_score, R.p6_cov, R.p6_min_ratio, R.p6_snr_db, R.pre_rho,
+        (unsigned)R.quality, status, aa_json,
+        (!R.mode5 && R.has_addr) ? (unsigned)R.addrCnt : 0u, hex);
     fflush(G.jsonl_fp);
 }
 
@@ -386,6 +343,32 @@ static void writeJsonlSsr(const char* subtype, uint64_t smp, int p1, int p3, int
         "{\"type\":\"SSR\",\"subtype\":\"%s\",\"smp\":%llu,\"mono\":%.6f,"
         "\"p1\":%d,\"p3\":%d,\"p4\":%d,\"code\":%d}\n",
         subtype, (unsigned long long)smp, monotonicSec(), p1, p3, p4, code);
+    fflush(G.jsonl_fp);
+}
+
+static void writeJsonlP6Reject(uint64_t smp, int p1, int p2,
+                               const UplinkResult& R) {
+    if (!G.jsonl_fp || !G.p6_diagnostics || R.valid) return;
+
+    char hex[32] = {0};
+    int nbytes = R.nbits / 8;
+    for (int b = 0; b < nbytes && b < 14; ++b)
+        snprintf(hex + b * 2, 3, "%02X", R.bytes[b]);
+
+    double snr_db = (p2 > 0 && p1 > 0)
+                  ? 20.0 * log10((double)p1 / (double)p2) : 0.0;
+    int uf = R.nbits > 0 ? (int)ufOf(R.bytes) : -1;
+    fprintf(G.jsonl_fp,
+        "{\"type\":\"P6_REJECTED\",\"smp\":%llu,\"mono\":%.6f,"
+        "\"reason\":\"%s\",\"uf\":%d,\"nbits\":%d,\"p1\":%d,\"p2\":%d,"
+        "\"snr_db\":%.2f,\"df_hz\":%.1f,\"spr_us\":%.3f,\"lock\":%.3f,"
+        "\"cov\":%.3f,\"p6min\":%.3f,\"p6snr_db\":%.2f,\"rho\":%.3f,"
+        "\"q\":%u,\"hex\":\"%s\"}\n",
+        (unsigned long long)smp, monotonicSec(),
+        R.reject_reason ? R.reject_reason : "unknown",
+        uf, R.nbits, p1, p2, snr_db, R.freq_off_hz, R.spr_us,
+        R.spr_score, R.p6_cov, R.p6_min_ratio, R.p6_snr_db,
+        R.pre_rho, (unsigned)R.quality, hex);
     fflush(G.jsonl_fp);
 }
 
@@ -456,113 +439,7 @@ static void keepOverlap(uint32_t total, uint32_t consumed) {
     G.overlap = keep;
 }
 
-// ---------- Beast-Ausgabe (Basisfunktionen) ----------
-static void beastPut(std::vector<uint8_t> &out, uint8_t b) {
-    out.push_back(b);
-    if (b == 0x1A) out.push_back(0x1A);
-}
-
-static void netBroadcast(const uint8_t *buf, size_t len);
-
-static std::vector<uint8_t> g_beast_buf;
-
-static inline bool beastEnabled() {
-    return G.beast_fp != nullptr || G.listen_fd >= 0;
-}
-
-static void beastFlush() {
-    if (g_beast_buf.empty()) return;
-    if (G.beast_fp) {
-        if (fwrite(g_beast_buf.data(), 1, g_beast_buf.size(), G.beast_fp)
-                != g_beast_buf.size())
-            fprintf(stderr, "Warnung: Beast-Ausgabe unvollstaendig geschrieben\n");
-        fflush(G.beast_fp);
-    }
-    if (G.listen_fd >= 0)
-        netBroadcast(g_beast_buf.data(), g_beast_buf.size());
-    g_beast_buf.clear();
-}
-
-static void beastOpenFile() {
-    if (!G.beast_file) return;
-    if (strcmp(G.beast_file, "-") == 0) {
-        G.beast_fp = stdout;
-        if (G.print_detected || G.print_all || G.print_order)
-            fprintf(stderr, "Hinweis: Textausgaben gehen bei --beast-out - "
-                            "nach stderr\n");
-    } else {
-        G.beast_fp = fopen(G.beast_file, "wb");
-        if (!G.beast_fp) die("Beast-Ausgabedatei kann nicht geoeffnet werden");
-    }
-}
-
-// Textausgabe-Stream (stdout, oder stderr bei --beast-out -)
 static FILE *G_txt = stdout;
-
-// ---------- Beast-TCP-Server ----------
-static void netOpen() {
-    if (G.beast_port <= 0) return;
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) die("socket() fehlgeschlagen");
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons((uint16_t)G.beast_port);
-    if (bind(fd, (sockaddr *)&addr, sizeof(addr)) < 0) die("bind() fehlgeschlagen");
-    if (listen(fd, 8) < 0) die("listen() fehlgeschlagen");
-    G.listen_fd = fd;
-    fprintf(stderr, "Beast-Server lauscht auf Port %d\n", G.beast_port);
-}
-
-static void *netAcceptThread(void *) {
-    while (!g_exit) {
-        int c = accept(G.listen_fd, nullptr, nullptr);
-        if (c < 0) {
-            if (errno == EINTR) continue;
-            if (g_exit) break;
-            usleep(100000);
-            continue;
-        }
-        int one = 1;
-        setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        fcntl(c, F_SETFL, fcntl(c, F_GETFL, 0) | O_NONBLOCK);
-        pthread_mutex_lock(&G.net_mutex);
-        G.clients.push_back(c);
-        size_t active = G.clients.size();
-        pthread_mutex_unlock(&G.net_mutex);
-        fprintf(stderr, "Beast-Client verbunden (%zu aktiv)\n", active);
-    }
-    return nullptr;
-}
-
-static void netBroadcast(const uint8_t *buf, size_t len) {
-    pthread_mutex_lock(&G.net_mutex);
-    for (size_t k = 0; k < G.clients.size();) {
-        ssize_t n = send(G.clients[k], buf, len, MSG_NOSIGNAL);
-        if (n != (ssize_t)len) {
-            close(G.clients[k]);
-            G.clients.erase(G.clients.begin() + k);
-            fprintf(stderr, "Beast-Client getrennt\n");
-            continue;
-        }
-        k++;
-    }
-    pthread_mutex_unlock(&G.net_mutex);
-}
-
-static void netClose() {
-    if (G.listen_fd < 0) return;
-    shutdown(G.listen_fd, SHUT_RDWR);
-    close(G.listen_fd);
-    pthread_join(G.net_thread, nullptr);
-    pthread_mutex_lock(&G.net_mutex);
-    for (int c : G.clients) close(c);
-    G.clients.clear();
-    pthread_mutex_unlock(&G.net_mutex);
-    G.listen_fd = -1;
-}
 
 // ---------- Detektion: rate-unabhaengige Bausteine ----------
 static inline bool ratioGt(int a, int b, int rq) { return a * 256 > rq * b; }
@@ -826,6 +703,8 @@ static int estimateLength(int i, int p1_ref) {
 }
 
 static const double WEAK_MARGIN = 0.3;
+static constexpr int MIN_VITERBI_QUALITY = 120;
+static constexpr double MIN_P6_SNR_DB = 6.0;
 
 // ===================== Viterbi-DPSK (Paket 1) =====================
 // Zeitachse wie p6sim: 20-MS/s-Index, P1-Vorderflanke = 160, Datenchip j ab anchor + 5*j
@@ -1277,8 +1156,20 @@ static void collectStats(const UplinkResult &R) {
 
 static double g_spr_offset_us = 0.0;
 
+static double medianMagnitude(int i, double t0_us, double t1_us) {
+    const Timing &T = G.tm;
+    int a = i + (int)std::ceil(T.f(t0_us));
+    int b = i + (int)std::floor(T.f(t1_us));
+    if (a < 0 || b >= (int)g_valid_samples || b < a) return -1.0;
+    std::vector<int> values;
+    values.reserve((size_t)(b - a + 1));
+    for (int k = a; k <= b; ++k) values.push_back(G.mag[k]);
+    std::sort(values.begin(), values.end());
+    return values[values.size() / 2];
+}
+
 static void evalP6Envelope(int i, int p1_ref, int nbits,
-                           double &cov, double &min_ratio) {
+                           double &cov, double &min_ratio, double &snr_db) {
     const Timing &T = G.tm;
     double t1_us = (nbits == 112) ? 33.0 : 19.0;
     int a = i + (int)std::ceil(T.f(4.0));
@@ -1286,6 +1177,7 @@ static void evalP6Envelope(int i, int p1_ref, int nbits,
     if (a < 0 || b >= (int)g_valid_samples || b < a || p1_ref <= 0) {
         cov = 0.0;
         min_ratio = 0.0;
+        snr_db = -999.0;
         return;
     }
     int min_v = 255, above = 0, total = b - a + 1;
@@ -1297,13 +1189,49 @@ static void evalP6Envelope(int i, int p1_ref, int nbits,
     }
     cov = (double)above / total;
     min_ratio = (double)min_v / p1_ref;
+
+    double signal = medianMagnitude(i, 5.0, t1_us);
+    double end_us = (nbits == 112) ? us::P6_END112 : us::P6_END56;
+    double noise1 = medianMagnitude(i, 1.1, 1.7);
+    double noise2 = medianMagnitude(i, end_us + 0.5, end_us + 1.8);
+    double noise = std::max(1.0, std::max(noise1, noise2));
+    snr_db = 20.0 * std::log10(std::max(1.0, signal) / noise);
+}
+
+static bool validUplinkFormat(const uint8_t *b, int nbits) {
+    uint32_t uf = ufOf(b);
+    if (isMode5Format(b, nbits)) return true;
+
+    if (uf == 0 || uf == 4 || uf == 5 || uf == 11) {
+        if (nbits != 56) return false;
+    } else if (uf == 16 || uf == 20 || uf == 21 || uf == 24) {
+        if (nbits != 112) return false;
+    } else {
+        return false;
+    }
+
+    if (uf == 0 && (bits(b, 6, 8) != 0 || bits(b, 10, 13) != 0 ||
+                    bits(b, 23, 32) != 0))
+        return false;
+    return true;
 }
 
 static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
     UplinkResult R;
-    if (nbits == 0) return R;
-    evalP6Envelope(i, p1_ref, nbits, R.p6_cov, R.p6_min_ratio);
-    if (R.p6_cov < 0.65) return R;
+    R.nbits = nbits;
+    if (nbits == 0) {
+        R.reject_reason = "length";
+        return R;
+    }
+    evalP6Envelope(i, p1_ref, nbits, R.p6_cov, R.p6_min_ratio, R.p6_snr_db);
+    if (R.p6_cov < 0.65) {
+        R.reject_reason = "p6_coverage";
+        return R;
+    }
+    if (R.p6_snr_db < MIN_P6_SNR_DB) {
+        R.reject_reason = "p6_snr";
+        return R;
+    }
 
     // --- Viterbi-Pfad (Paket 4) ---
     if (g_haveChan) {
@@ -1321,21 +1249,37 @@ static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
             R.quality     = (uint8_t)dpskQuality(br.v.metric);
             R.pre_rho     = br.rho;
 
-            if (R.pre_rho < 0.50 || R.spr_score < 0.50 || R.quality < 80)
+            if (R.pre_rho < 0.50) {
+                R.reject_reason = "preamble_rho";
                 return R;
+            }
+            if (R.spr_score < 0.50) {
+                R.reject_reason = "spr_lock";
+                return R;
+            }
+            if (R.quality < MIN_VITERBI_QUALITY) {
+                R.reject_reason = "viterbi_quality";
+                return R;
+            }
 
             memset(R.bytes, 0, sizeof(R.bytes));
             for (int b = 0; b < nbits; ++b) {
                 if (br.v.bits[b]) R.bytes[b / 8] |= (uint8_t)(0x80 >> (b % 8));
-                R.margin[b] = 1.0f;
             }
-            R.mean_margin = 1.0;
-            R.min_margin  = 1.0;
+            if (!validUplinkFormat(R.bytes, R.nbits)) {
+                R.reject_reason = "uplink_format";
+                return R;
+            }
+            R.mean_margin = (double)R.quality / 255.0;
+            R.min_margin = R.mean_margin;
             R.weak_bits   = 0;
             R.viterbi     = true;
             collectStats(R);
             R.valid       = true;
+            R.reject_reason = nullptr;
             G.uplink_ok++;
+        } else {
+            R.reject_reason = "blind_decode";
         }
         return R;
     }
@@ -1346,15 +1290,28 @@ static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
     R.spr_us      = L.t_us;
     R.spr_score   = L.score;
     R.freq_off_hz = fe.hz;
-    if (!L.ok || R.spr_score < 0.50) return R;
-    if (!demodBits(i, L, fe.w, nbits, R)) return R;
+    if (!L.ok || R.spr_score < 0.50) {
+        R.reject_reason = "spr_lock";
+        return R;
+    }
+    if (!demodBits(i, L, fe.w, nbits, R)) {
+        R.reject_reason = "demodulation";
+        return R;
+    }
 
     if (ufLength(ufOf(R.bytes)) == 112 && R.nbits == 56) {
         UplinkResult R2 = R;
         if (demodBits(i, L, fe.w, 112, R2)) {
             R = R2;
-            evalP6Envelope(i, p1_ref, 112, R.p6_cov, R.p6_min_ratio);
-            if (R.p6_cov < 0.65) return UplinkResult{};
+            evalP6Envelope(i, p1_ref, 112, R.p6_cov, R.p6_min_ratio, R.p6_snr_db);
+            if (R.p6_cov < 0.65) {
+                R.reject_reason = "p6_coverage";
+                return R;
+            }
+            if (R.p6_snr_db < MIN_P6_SNR_DB) {
+                R.reject_reason = "p6_snr";
+                return R;
+            }
         }
     }
 
@@ -1381,9 +1338,17 @@ static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
     }
 
     R.quality = combineQuality(R);
-    if (R.quality < 80) return R;
+    if (R.quality < 80) {
+        R.reject_reason = "legacy_quality";
+        return R;
+    }
+    if (!validUplinkFormat(R.bytes, R.nbits)) {
+        R.reject_reason = "uplink_format";
+        return R;
+    }
     collectStats(R);
     R.valid = true;
+    R.reject_reason = nullptr;
     if (R.weak_bits * 4 > R.nbits) G.uplink_weak++;
     else                           G.uplink_ok++;
     return R;
@@ -1498,10 +1463,10 @@ static void analyzeBurst(uint64_t pos, MsgCode code, const uint8_t *m,
     if (R && R->valid) {
         fprintf(G_txt, "\n  [P6] %d Bit spr=%.2f us lock=%.2f "
                        "margin=%.2f/%.2f weak=%d df=%+.1f kHz Q=%u "
-                       "cov=%.2f p6min=%.2f rho=%.2f HEX=",
+                       "cov=%.2f p6min=%.2f p6snr=%.1f dB rho=%.2f HEX=",
                 R->nbits, R->spr_us, R->spr_score, R->mean_margin,
                 R->min_margin, R->weak_bits, R->freq_off_hz / 1e3, R->quality,
-                R->p6_cov, R->p6_min_ratio, R->pre_rho);
+                R->p6_cov, R->p6_min_ratio, R->p6_snr_db, R->pre_rho);
         for (int k = 0; k < R->nbits / 8; k++) fprintf(G_txt, "%02X", R->bytes[k]);
         printUfFields(*R, pos);
     } else if (R && G.uplink_decode) {
@@ -1509,80 +1474,6 @@ static void analyzeBurst(uint64_t pos, MsgCode code, const uint8_t *m,
                 R->spr_us, R->spr_score);
     }
     fprintf(G_txt, "\n");
-}
-
-// ---------- Beast-Ausgabe: eigene Typen (0x55 / 0x56) ----------
-static const uint8_t BEAST_VERSION = 1;
-
-enum BeamCode : uint8_t { BEAM_MAIN = 0, BEAM_SLS = 1, BEAM_UNSURE = 2, BEAM_MODES = 3 };
-
-static BeamCode beamCode(const char *s) {
-    if (!strcmp(s, "MAIN"))   return BEAM_MAIN;
-    if (!strcmp(s, "SLS"))    return BEAM_SLS;
-    if (!strcmp(s, "MODE-S")) return BEAM_MODES;
-    return BEAM_UNSURE;
-}
-
-static void beastHeader(std::vector<uint8_t> &out, uint8_t type,
-                        uint64_t sample_idx, uint8_t signal) {
-    uint64_t ts = sample_idx / G.samplerate * 12000000ULL
-                + (sample_idx % G.samplerate) * 12000000ULL / G.samplerate;
-    out.push_back(0x1A);
-    out.push_back(type);
-    for (int s = 40; s >= 0; s -= 8) beastPut(out, (uint8_t)(ts >> s));
-    beastPut(out, signal);
-}
-
-static inline void put16(std::vector<uint8_t> &out, int v) {
-    uint16_t u = (uint16_t)(int16_t)std::max(-32768, std::min(32767, v));
-    beastPut(out, (uint8_t)(u >> 8));
-    beastPut(out, (uint8_t)u);
-}
-
-// 0x55 - Pulsdetektion, Payload 6 Byte
-static void beastEmitPulse(uint64_t pos, MsgCode code, int p1, int p2,
-                           const char *beam, double db) {
-    if (!beastEnabled()) return;
-    beastHeader(g_beast_buf, BEAST_TYPE_PULSE, pos, (uint8_t)p1);
-    beastPut(g_beast_buf, BEAST_VERSION);
-    beastPut(g_beast_buf, (uint8_t)code);
-    beastPut(g_beast_buf, beamCode(beam));
-    beastPut(g_beast_buf, (uint8_t)p1);
-    beastPut(g_beast_buf, (uint8_t)p2);
-    int hdb = (int)lround(db * 2.0);
-    beastPut(g_beast_buf, (uint8_t)(int8_t)std::max(-128, std::min(127, hdb)));
-}
-
-static inline uint8_t u8q(double v) {
-    return (uint8_t)lround(std::max(0.0, std::min(1.0, v)) * 255.0);
-}
-
-// 0x56 - demodulierter Mode-S-Uplink, Payload 25 Byte
-static void beastEmitUplink(uint64_t pos, int p1, const UplinkResult &R) {
-    if (!beastEnabled() || !R.valid) return;
-    uint32_t uf = bits(R.bytes, 1, 5);
-    if ((uf >> 3) == 3) uf = 24;
-    int exp = ufLength(uf);
-
-    uint8_t flags = 0;
-    if (R.nbits == 112)                flags |= 0x01;
-    if (exp && exp != R.nbits)         flags |= 0x02;
-    if (R.weak_bits * 4 > R.nbits)     flags |= 0x04;
-
-    beastHeader(g_beast_buf, BEAST_TYPE_UPLINK, pos, (uint8_t)p1);
-    beastPut(g_beast_buf, BEAST_VERSION);
-    beastPut(g_beast_buf, flags);
-    beastPut(g_beast_buf, R.quality);
-    beastPut(g_beast_buf, u8q(R.spr_score));
-    beastPut(g_beast_buf, u8q(R.mean_margin));
-    beastPut(g_beast_buf, u8q(R.min_margin));
-    beastPut(g_beast_buf, (uint8_t)std::min(255, R.weak_bits));
-    int spr_ns = (int)lround(R.spr_us * 1000.0);
-    beastPut(g_beast_buf, (uint8_t)(spr_ns >> 8));
-    beastPut(g_beast_buf, (uint8_t)spr_ns);
-    put16(g_beast_buf, (int)lround(R.freq_off_hz / 10.0));
-    for (int k = 0; k < 14; k++)
-        beastPut(g_beast_buf, k < R.nbits / 8 ? R.bytes[k] : 0);
 }
 
 // ---------- Detektion: Hauptschleife ----------
@@ -1610,7 +1501,18 @@ static bool handleModeS(const uint8_t *m, uint32_t i, int r1,
     int nbits = estimateLength((int)i, r1);
 
     if (G.uplink_decode) {
-        if (nbits == 0) return false;
+        if (nbits == 0) {
+            if (!G.p6_diagnostics) return false;
+            R.nbits = 0;
+            R.reject_reason = "length";
+            int p1 = 0, p2 = 0;
+            for (int k = 0; k < T.pw; ++k) {
+                p1 = std::max<int>(p1, m[k]);
+                p2 = std::max<int>(p2, m[T.p2 + k]);
+            }
+            writeJsonlP6Reject(G.sample_base + i, p1, p2, R);
+            return false;
+        }
         R = decodeUplink((int)i, r1, nbits);
     }
     skip = (nbits == 112) ? T.skip_s112
@@ -1623,7 +1525,6 @@ struct PendingP6 {
     uint64_t     pos = 0;
     int          p1 = 0;
     int          p2 = 0;
-    double       db = 0.0;
     UplinkResult R;
     uint8_t      samples[32] = {0};
     int          show = 0;
@@ -1717,8 +1618,6 @@ static void flushEmitterTrain() {
             }
         }
 
-        beastEmitPulse(ev.pos, MSG_S, ev.p1, ev.p2, "MODE-S", ev.db);
-        beastEmitUplink(ev.pos, ev.p1, ev.R);
         writeJsonlP6(ev.pos, ev.p1, ev.p2, ev.R);
         if (G.print_detected) {
             analyzeBurst(ev.pos, MSG_S, ev.samples, &ev.R);
@@ -1804,9 +1703,6 @@ if (code != MSG_NONE) {
                 p1 = std::max<int>(p1, m[k]);
                 p2 = std::max<int>(p2, m[T.p2 + k]);
             }
-            double db;
-            const char *beam = beamClass(code, p1, p2, db);
-
             if (code == MSG_S && haveR && R.valid) {
                 const uint64_t dwell_gap = (uint64_t)llround(0.055 * G.samplerate);
                 if (!g_emitCtx.train.empty() && pos > g_emitCtx.last_pos &&
@@ -1817,15 +1713,14 @@ if (code != MSG_NONE) {
                 ev.pos  = pos;
                 ev.p1   = p1;
                 ev.p2   = p2;
-                ev.db   = db;
                 ev.R    = R;
                 ev.show = std::min(show, 32);
                 memcpy(ev.samples, m, (size_t)ev.show);
                 g_emitCtx.train.push_back(ev);
                 g_emitCtx.last_pos = pos;
             } else {
-                beastEmitPulse(pos, code, p1, p2, beam, db);
-                if (haveR) beastEmitUplink(pos, p1, R);
+                if (code == MSG_S && haveR)
+                    writeJsonlP6Reject(pos, p1, p2, R);
 
                 if (code != MSG_S) {
                     int off = (code == MSG_A || code == MSG_A_ACAC || code == MSG_A_ACSAC)
@@ -2068,6 +1963,7 @@ static void showHelp() {
 "  --gain <dB|auto|max>    Tuner-Gain in dB (Default max)\n"
 "  --samplerate <r>        2.4..3.2 MS/s oder Hz (Default 2.5). Bei --file:\n"
 "                          MUSS der Rate der Aufzeichnung entsprechen!\n"
+"                          --chan erfordert exakt 2.5 MS/s.\n"
 "  --ppm <-200..200>       Frequenzkorrektur des Tuners in ppm\n"
 "  --agc                   RTL2832-AGC aktivieren\n"
 "  --size <bytes>          Blockgroesse, Vielfaches von 16384, min. 16384\n"
@@ -2085,14 +1981,12 @@ static void showHelp() {
 "Ausgabe:\n"
 "  --out-dir <pfad>        Ausgabeverzeichnis fuer JSONL/cu8 Dateien\n"
 "  --save-iq               IQ-Daten (im cu8 Format) speichern\n"
+"  --p6-diagnostics        Abgelehnte P6-Kandidaten als JSONL ausgeben\n"
 "  --msgs                  Erkannte Abfragen mit Samples ausgeben\n"
 "  --order                 Reihenfolge der Abfragen ausgeben\n"
 "  --blmode                Baseline-Werte fuer mpa/mnf/mnfc ausgeben\n"
 "  --print                 Alle Magnitude-Werte ausgeben (langsam!)\n"
-"  --uplink-decode         EXPERIMENTELL: Mode-S-P6 (DPSK) demodulieren,\n"
-"                          Ausgabe mit --msgs und als Beast-Typ 0x56\n"
-"  --beast-out <pfad|->    Beast-Binaerausgabe in Datei oder stdout\n"
-"  --net-beast-port <p>    Beast-TCP-Server (Standard-Port 30005)\n"
+"  --uplink-decode         EXPERIMENTELL: Mode-S-P6 (DPSK) demodulieren\n"
 "  --help                  Diese Hilfe\n");
 }
 
@@ -2198,16 +2092,14 @@ for (int i = 1; i < argc; i++) {
             G.baseline = true;
         } else if (!strcmp(a, "--print")) {
             G.print_all = true;
-        } else if (!strcmp(a, "--beast-out")) {
-            G.beast_file = needArg(argc, argv, i);
-        } else if (!strcmp(a, "--net-beast-port")) {
-            G.beast_port = (int)parseLong(a, needArg(argc, argv, i), 1, 65535);
         } else if (!strcmp(a, "--dl")) {
             die("--dl (1090 MHz) wird nicht unterstuetzt");
         } else if (!strcmp(a, "--out-dir")) {
             G.out_dir = needArg(argc, argv, i);
         } else if (!strcmp(argv[i], "--save-iq")) {
             G.save_iq = true;
+        } else if (!strcmp(a, "--p6-diagnostics")) {
+            G.p6_diagnostics = true;
         } else if (!strcmp(a, "--help")) {
             showHelp();
             exit(0);
@@ -2218,11 +2110,19 @@ for (int i = 1; i < argc; i++) {
         }
     }
 
+    if (g_haveChan && G.samplerate != DEFAULT_RATE) {
+        fprintf(stderr, "--chan benoetigt exakt 2.5 MS/s; angefordert: %u Hz\n",
+                G.samplerate);
+        std::exit(1);
+    }
     if (vcompareLog) {
         if (!g_haveChan || !G.filename) { fprintf(stderr, "--vcompare braucht --file und --chan\n"); std::exit(1); }
         std::exit(viterbiCompare(G.filename, vcompareLog, g_chan));
     }
-    if (G.beast_file && !strcmp(G.beast_file, "-")) G_txt = stderr;
+    if (G.p6_diagnostics && G.out_dir.empty())
+        die("--p6-diagnostics benoetigt --out-dir");
+    if (G.p6_diagnostics && !G.uplink_decode)
+        die("--p6-diagnostics benoetigt --uplink-decode");
 }
 
 // ---------- Verarbeitung ----------
@@ -2258,7 +2158,6 @@ static void processBlock(uint32_t len, bool last) {
     g_valid_samples = total;
     uint32_t consumed = detectBlock(total, last);
     keepOverlap(total, consumed);
-    beastFlush();
     g_samples += len / 2;
     if (G.continuous) {
         printStats((uint32_t)g_samples);
@@ -2282,7 +2181,7 @@ int main(int argc, char **argv) {
     }
     if (G.uplink_decode)
         fprintf(stderr, "Hinweis: --uplink-decode ist experimentell und nicht "
-                        "validiert (Quality/Flags im 0x56-Frame beachten)\n");
+                        "validiert (Quality-Gates in JSONL beachten)\n");
 
     G.iq_buf.resize(G.data_len);
     G.iq_work.resize(G.data_len);
@@ -2295,12 +2194,6 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
     signal(SIGPIPE, SIG_IGN);
-
-    beastOpenFile();
-    netOpen();
-    if (G.listen_fd >= 0 &&
-        pthread_create(&G.net_thread, nullptr, netAcceptThread, nullptr) != 0)
-        die("Netzwerk-Thread konnte nicht gestartet werden");
 
     if (pthread_create(&G.reader_thread, nullptr, readerThread, nullptr) != 0)
         die("Reader-Thread konnte nicht gestartet werden");
@@ -2349,9 +2242,6 @@ int main(int argc, char **argv) {
     pthread_join(G.reader_thread, nullptr);
 
     if (G.dev) { rtlsdr_close(G.dev); G.dev = nullptr; }
-    netClose();
-    if (G.beast_fp && G.beast_fp != stdout) fclose(G.beast_fp);
-    else if (G.beast_fp) fflush(stdout);
     flushEmitterTrain();
     closeOutputs();
     return 0;
