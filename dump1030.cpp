@@ -55,6 +55,9 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <rtl-sdr.h>
+#include <sys/stat.h>
+#include <cerrno>
+#include <ctime>
 
 // ---------- Konstanten ----------
 static constexpr double PI           = 3.14159265358979323846;
@@ -193,7 +196,11 @@ struct UplinkResult {
     int     weak_bits = 0;       // Bits mit |cos dphi| < 0,3
     double  freq_off_hz = 0.0;   // geschaetzter Frequenzoffset
     uint8_t quality = 0;         // 0..255, kombiniert (fuer Beast)
-    uint32_t addr = 0; int addrCnt = 0; bool viterbi = false;
+    uint32_t addr = 0;
+    int     addrCnt = 0;
+    bool    has_addr = false;
+    bool    mode5 = false;
+    bool    viterbi = false;
     double  p6_cov = 0.0;        // Anteil Samples >= 0.4*P1 im P6-Fenster
     double  p6_min_ratio = 0.0;  // min(mag) / P1 im P6-Fenster
     double  pre_rho = 0.0;       // normierte Praeambel-/SPR-Korrelation (0..1)
@@ -256,6 +263,12 @@ struct State {
     // RTL-SDR / Datei
     rtlsdr_dev_t *dev = nullptr;
     int fd = -1;
+
+    // Ausgabedirectory für JSONL und .cu8
+    std::string out_dir;
+    bool        save_iq  = false;
+    FILE*       jsonl_fp = nullptr;
+    FILE*       iq_fp    = nullptr;
 };
 
 static State G;
@@ -272,8 +285,109 @@ static void sigHandler(int) {
     exit(1);
 }
 
+// ---------- JSONL/cu8 Ausgabe ----------
 
+static bool ensureDir(const std::string& path) {
+    if (path.empty()) return false;
+    std::string cur;
+    for (size_t i = 0; i < path.size(); ++i) {
+        cur += path[i];
+        if (path[i] == '/' || i + 1 == path.size()) {
+            if (cur == "/") continue;
+            if (mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST) return false;
+        }
+    }
+    return true;
+}
 
+static bool initOutputs() {
+    if (G.out_dir.empty()) return true;
+    if (!ensureDir(G.out_dir)) {
+        fprintf(stderr, "Fehler: Kann Ausgabeverzeichnis '%s' nicht anlegen: %s\n",
+                G.out_dir.c_str(), strerror(errno));
+        return false;
+    }
+
+    time_t now = time(nullptr);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_now);
+
+    std::string jsonl_path = G.out_dir + "/events_" + ts + ".jsonl";
+    G.jsonl_fp = fopen(jsonl_path.c_str(), "w");
+    if (!G.jsonl_fp) {
+        fprintf(stderr, "Fehler: Kann '%s' nicht oeffnen: %s\n",
+                jsonl_path.c_str(), strerror(errno));
+        return false;
+    }
+
+    if (G.save_iq) {
+        std::string iq_path = G.out_dir + "/raw_" + ts + ".cu8";
+        G.iq_fp = fopen(iq_path.c_str(), "wb");
+        if (!G.iq_fp) {
+            fprintf(stderr, "Fehler: Kann '%s' nicht oeffnen: %s\n",
+                    iq_path.c_str(), strerror(errno));
+            fclose(G.jsonl_fp);
+            G.jsonl_fp = nullptr;
+            return false;
+        }
+    }
+    return true;
+}
+
+static void closeOutputs() {
+    if (G.jsonl_fp) { fflush(G.jsonl_fp); fclose(G.jsonl_fp); G.jsonl_fp = nullptr; }
+    if (G.iq_fp)    { fflush(G.iq_fp);    fclose(G.iq_fp);    G.iq_fp    = nullptr; }
+}
+
+// ---------- JSONL/cu8 Ausgabe ----------
+
+static double monotonicSec() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static inline uint32_t ufOf(const uint8_t *b);
+
+static void writeJsonlP6(uint64_t smp, int p1, int p2, const UplinkResult& R) {
+    if (!G.jsonl_fp || !R.valid) return;
+
+    char hex[32] = {0};
+    int nbytes = R.nbits / 8;
+    for (int b = 0; b < nbytes; ++b)
+        snprintf(hex + b * 2, 3, "%02X", R.bytes[b]);
+
+    char aa_json[16];
+    if (!R.mode5 && R.has_addr && R.addrCnt >= 2)
+        snprintf(aa_json, sizeof(aa_json), "\"%06X\"", R.addr);
+    else
+        snprintf(aa_json, sizeof(aa_json), "null");
+
+    double snr_db = (p2 > 0 && p1 > 0) ? 20.0 * log10((double)p1 / (double)p2) : 0.0;
+
+    fprintf(G.jsonl_fp,
+        "{\"type\":\"P6\",\"smp\":%llu,\"mono\":%.6f,\"uf\":%d,\"mode5\":%s,\"nbits\":%d,"
+        "\"p1\":%d,\"p2\":%d,\"snr_db\":%.2f,\"df_hz\":%.1f,"
+        "\"spr_us\":%.3f,\"lock\":%.3f,\"cov\":%.3f,\"p6min\":%.3f,\"rho\":%.3f,"
+        "\"q\":%u,\"aa\":%s,\"aa_cnt\":%u,\"hex\":\"%s\"}\n",
+        (unsigned long long)smp, monotonicSec(),
+        (int)ufOf(R.bytes), R.mode5 ? "true" : "false", R.nbits,
+        p1, p2, snr_db, R.freq_off_hz,
+        R.spr_us, R.spr_score, R.p6_cov, R.p6_min_ratio, R.pre_rho,
+        (unsigned)R.quality, aa_json, (!R.mode5 && R.has_addr) ? (unsigned)R.addrCnt : 0u, hex);
+    fflush(G.jsonl_fp);
+}
+
+static void writeJsonlSsr(const char* subtype, uint64_t smp, int p1, int p3, int p4, int code) {
+    if (!G.jsonl_fp) return;
+    fprintf(G.jsonl_fp,
+        "{\"type\":\"SSR\",\"subtype\":\"%s\",\"smp\":%llu,\"mono\":%.6f,"
+        "\"p1\":%d,\"p3\":%d,\"p4\":%d,\"code\":%d}\n",
+        subtype, (unsigned long long)smp, monotonicSec(), p1, p3, p4, code);
+    fflush(G.jsonl_fp);
+}
 
 
 // ---------- Magnitude + I/Q-Historie ----------
@@ -1081,6 +1195,44 @@ static uint8_t combineQuality(const UplinkResult &R) {
 static uint32_t bits(const uint8_t *b, int first, int last);
 static int ufLength(uint32_t uf);
 
+static inline bool isMode5Format(const uint8_t *b, int nbits) {
+    uint32_t uf = ufOf(b);
+    if (uf == 3 || uf == 6 || uf == 14) return true;
+    if (uf == 24 && nbits == 56)        return true;
+
+    // ICAO Annex 10 Vol. IV (3.1.2.8.2): Bei UF=0 muessen die Spare-Bits
+    // 6..8, 10..13 und 23..32 zwingend 0 sein.
+    if (uf == 0 && nbits == 56) {
+        if (bits(b, 6, 8) != 0 || bits(b, 10, 13) != 0 || bits(b, 23, 32) != 0)
+            return true;
+    }
+
+    // ICAO Annex 10 Vol. IV (3.1.2.7.4): Isolierte Comm-C-ELM-End-/Abbruchsegmente
+    // (RC=2 oder RC=3) ohne aktive Segment-Sequenz.
+    if (uf == 24 && nbits == 112) {
+        uint32_t rc = bits(b, 3, 4);
+        if (rc == 2 || rc == 3) return true;
+    }
+
+    return false;
+}
+
+static inline bool hasAircraftAddress(uint32_t uf, int nbits) {
+    switch (uf) {
+        case 0: case 4: case 5:    return nbits == 56;
+        case 16: case 20: case 21:
+        case 24:                   return nbits == 112;
+        default:                   return false;
+    }
+}
+
+static uint32_t apToAddressBytes(const uint8_t* bytes, int nbits) {
+    std::vector<uint8_t> b((size_t)nbits);
+    for (int k = 0; k < nbits; ++k)
+        b[k] = (bytes[k / 8] >> (7 - k % 8)) & 1;
+    return apToAddress(b);
+}
+
 static inline uint32_t ufOf(const uint8_t *b) {
     uint32_t uf = bits(b, 1, 5);
     return ((uf >> 3) == 3) ? 24 : uf;
@@ -1180,8 +1332,6 @@ static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
             R.mean_margin = 1.0;
             R.min_margin  = 1.0;
             R.weak_bits   = 0;
-            R.addr        = apToAddress(br.v.bits);
-            R.addrCnt     = g_addrTrack.seen(R.addr, (G.sample_base + (uint64_t)i) / (double)G.samplerate);
             R.viterbi     = true;
             collectStats(R);
             R.valid       = true;
@@ -1272,9 +1422,11 @@ static void printUfFields(const UplinkResult &R, uint64_t pos = 0) {
     if ((uf >> 3) == 3) uf = 24;
     fprintf(G_txt, " UF=%u", uf);
     int exp = ufLength(uf);
-    if (exp && exp != R.nbits)
+    if (!R.mode5 && exp && exp != R.nbits)
         fprintf(G_txt, " [LAENGE? erwartet %d]", exp);
-    if (R.viterbi)
+    if (R.mode5)
+        fprintf(G_txt, " [Mode5]");
+    else if (R.has_addr)
         fprintf(G_txt, " AA=%06X%s", R.addr, R.addrCnt >= 2 ? " *" : " ?");
     switch (uf) {
     case 0: case 16:
@@ -1467,6 +1619,116 @@ static bool handleModeS(const uint8_t *m, uint32_t i, int r1,
     return true;
 }
 
+struct PendingP6 {
+    uint64_t     pos = 0;
+    int          p1 = 0;
+    int          p2 = 0;
+    double       db = 0.0;
+    UplinkResult R;
+    uint8_t      samples[32] = {0};
+    int          show = 0;
+};
+
+struct SyncSlot {
+    uint64_t phase = 0;
+    uint64_t last_pos = 0;
+};
+
+struct EmitterContext {
+    std::vector<PendingP6> train;
+    std::vector<SyncSlot>  mode5_slots;
+    uint64_t               last_pos = 0;
+};
+static EmitterContext g_emitCtx;
+
+static bool matchesMode5SyncSlot(uint64_t pos) {
+    uint64_t rate    = G.samplerate;
+    uint64_t max_age = 15ULL * rate;
+    uint64_t tol     = rate / 40; // +/- 25 ms
+    uint64_t phase   = pos % rate;
+
+    auto &slots = g_emitCtx.mode5_slots;
+    slots.erase(std::remove_if(slots.begin(), slots.end(), [&](const SyncSlot &s) {
+        return pos > s.last_pos && (pos - s.last_pos) > max_age;
+    }), slots.end());
+
+    for (const auto &s : slots) {
+        uint64_t d = (phase >= s.phase) ? (phase - s.phase) : (s.phase - phase);
+        if (d > rate / 2) d = rate - d;
+        if (d <= tol) return true;
+    }
+    return false;
+}
+
+static void recordMode5SyncSlot(uint64_t pos) {
+    uint64_t rate  = G.samplerate;
+    uint64_t tol   = rate / 40;
+    uint64_t phase = pos % rate;
+
+    for (auto &s : g_emitCtx.mode5_slots) {
+        uint64_t d = (phase >= s.phase) ? (phase - s.phase) : (s.phase - phase);
+        if (d > rate / 2) d = rate - d;
+        if (d <= tol) {
+            s.phase    = phase;
+            s.last_pos = pos;
+            return;
+        }
+    }
+    if (g_emitCtx.mode5_slots.size() >= 64)
+        g_emitCtx.mode5_slots.erase(g_emitCtx.mode5_slots.begin());
+    g_emitCtx.mode5_slots.push_back({phase, pos});
+}
+
+static void flushEmitterTrain() {
+    if (g_emitCtx.train.empty()) return;
+
+    bool explicit_mode5 = false;
+    for (const auto &ev : g_emitCtx.train) {
+        uint32_t uf = ufOf(ev.R.bytes);
+        if (isMode5Format(ev.R.bytes, ev.R.nbits) || (uf == 0 && ev.p2 > ev.p1)) {
+            explicit_mode5 = true;
+            break;
+        }
+    }
+
+    uint64_t first_pos = g_emitCtx.train.front().pos;
+    uint64_t last_pos  = g_emitCtx.train.back().pos;
+    bool train_mode5   = explicit_mode5
+                      || matchesMode5SyncSlot(first_pos)
+                      || matchesMode5SyncSlot(last_pos);
+
+    if (explicit_mode5) {
+        recordMode5SyncSlot(first_pos);
+        if (last_pos != first_pos) recordMode5SyncSlot(last_pos);
+    }
+
+    for (auto &ev : g_emitCtx.train) {
+        uint32_t uf = ufOf(ev.R.bytes);
+        ev.R.mode5 = train_mode5;
+        if (train_mode5) {
+            ev.R.has_addr = false;
+            ev.R.addr     = 0;
+            ev.R.addrCnt  = 0;
+        } else {
+            ev.R.has_addr = hasAircraftAddress(uf, ev.R.nbits);
+            if (ev.R.has_addr) {
+                ev.R.addr    = apToAddressBytes(ev.R.bytes, ev.R.nbits);
+                ev.R.addrCnt = g_addrTrack.seen(ev.R.addr, ev.pos / (double)G.samplerate);
+            }
+        }
+
+        beastEmitPulse(ev.pos, MSG_S, ev.p1, ev.p2, "MODE-S", ev.db);
+        beastEmitUplink(ev.pos, ev.p1, ev.R);
+        writeJsonlP6(ev.pos, ev.p1, ev.p2, ev.R);
+        if (G.print_detected) {
+            analyzeBurst(ev.pos, MSG_S, ev.samples, &ev.R);
+            printSamples(ev.samples, ev.show);
+            fputc('\n', G_txt);
+        }
+    }
+    g_emitCtx.train.clear();
+}
+
 static uint32_t detectBlock(uint32_t total, bool final) {
     const Timing &T = G.tm;
     const uint8_t *mag = G.mag.data();
@@ -1533,7 +1795,7 @@ static uint32_t detectBlock(uint32_t total, bool final) {
             }
         }
 
-        if (code != MSG_NONE) {
+if (code != MSG_NONE) {
             G.cur.count(code);
             if (G.print_order) G.order.push_back(code);
 
@@ -1545,17 +1807,59 @@ static uint32_t detectBlock(uint32_t total, bool final) {
             double db;
             const char *beam = beamClass(code, p1, p2, db);
 
-            beastEmitPulse(pos, code, p1, p2, beam, db);
-            if (haveR) beastEmitUplink(pos, p1, R);
+            if (code == MSG_S && haveR && R.valid) {
+                const uint64_t dwell_gap = (uint64_t)llround(0.055 * G.samplerate);
+                if (!g_emitCtx.train.empty() && pos > g_emitCtx.last_pos &&
+                    (pos - g_emitCtx.last_pos) > dwell_gap) {
+                    flushEmitterTrain();
+                }
+                PendingP6 ev;
+                ev.pos  = pos;
+                ev.p1   = p1;
+                ev.p2   = p2;
+                ev.db   = db;
+                ev.R    = R;
+                ev.show = std::min(show, 32);
+                memcpy(ev.samples, m, (size_t)ev.show);
+                g_emitCtx.train.push_back(ev);
+                g_emitCtx.last_pos = pos;
+            } else {
+                beastEmitPulse(pos, code, p1, p2, beam, db);
+                if (haveR) beastEmitUplink(pos, p1, R);
 
-            if (G.print_detected) {
-                analyzeBurst(pos, code, m, haveR ? &R : nullptr);
-                printSamples(m, show);
-                fputc('\n', G_txt);
+                if (code != MSG_S) {
+                    int off = (code == MSG_A || code == MSG_A_ACAC || code == MSG_A_ACSAC)
+                              ? T.p3_a : T.p3_c;
+                    int p3 = 0, p4 = 0;
+                    for (int k = 0; k < T.pw; k++)
+                        p3 = std::max<int>(p3, m[off + k]);
+                    if (code == MSG_A_ACAC || code == MSG_C_ACAC) {
+                        for (int k = 0; k < T.p4_short; k++)
+                            p4 = std::max<int>(p4, m[off + T.p4_gap + k]);
+                    } else if (code == MSG_A_ACSAC || code == MSG_C_ACSAC) {
+                        for (int k = 0; k < T.p4_long; k++)
+                            p4 = std::max<int>(p4, m[off + T.p4_gap + k]);
+                    }
+                    writeJsonlSsr(codeName(code), pos, p1, p3, p4, (int)code);
+                }
+
+                if (G.print_detected) {
+                    analyzeBurst(pos, code, m, haveR ? &R : nullptr);
+                    printSamples(m, show);
+                    fputc('\n', G_txt);
+                }
             }
         }
         i += (uint32_t)std::max(1, skip);
     }
+
+    const uint64_t dwell_gap = (uint64_t)llround(0.055 * G.samplerate);
+    uint64_t block_end = G.sample_base + limit;
+    if (final || (!g_emitCtx.train.empty() && block_end > g_emitCtx.last_pos &&
+                  (block_end - g_emitCtx.last_pos) > dwell_gap)) {
+        flushEmitterTrain();
+    }
+
     return std::min(i, total);
 }
 
@@ -1779,6 +2083,8 @@ static void showHelp() {
 "  --mnf <0..255>          Max. Noise Floor (fern)\n"
 "  --mnfc <0..255>         Max. Noise Floor (direkt neben Puls)\n"
 "Ausgabe:\n"
+"  --out-dir <pfad>        Ausgabeverzeichnis fuer JSONL/cu8 Dateien\n"
+"  --save-iq               IQ-Daten (im cu8 Format) speichern\n"
 "  --msgs                  Erkannte Abfragen mit Samples ausgeben\n"
 "  --order                 Reihenfolge der Abfragen ausgeben\n"
 "  --blmode                Baseline-Werte fuer mpa/mnf/mnfc ausgeben\n"
@@ -1898,6 +2204,10 @@ for (int i = 1; i < argc; i++) {
             G.beast_port = (int)parseLong(a, needArg(argc, argv, i), 1, 65535);
         } else if (!strcmp(a, "--dl")) {
             die("--dl (1090 MHz) wird nicht unterstuetzt");
+        } else if (!strcmp(a, "--out-dir")) {
+            G.out_dir = needArg(argc, argv, i);
+        } else if (!strcmp(argv[i], "--save-iq")) {
+            G.save_iq = true;
         } else if (!strcmp(a, "--help")) {
             showHelp();
             exit(0);
@@ -1940,6 +2250,10 @@ static uint32_t fetchBlock(bool &last) {
 static uint64_t g_samples = 0;
 
 static void processBlock(uint32_t len, bool last) {
+    if (G.iq_fp && len >= 2) {
+        fwrite(G.iq_work.data(), 1, len & ~(uint32_t)1, G.iq_fp);
+    }
+
     uint32_t total = computeMagnitude(len);
     g_valid_samples = total;
     uint32_t consumed = detectBlock(total, last);
@@ -1955,6 +2269,7 @@ static void processBlock(uint32_t len, bool last) {
 // ---------- main ----------
 int main(int argc, char **argv) {
     parseArgs(argc, argv);
+    if (!initOutputs()) return 1;
     buildLut();
     if (!G.filename) initRtlsdr();
     G.tm.init(G.samplerate);
@@ -2024,6 +2339,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  %s: %.3f (n=%u)\n", pn[p], g_pat_m[p] / g_pat_n[p], g_pat_n[p]);
     }
 
+
     // ---------- Aufraeumen ----------
     g_exit = true;
     if (G.dev) rtlsdr_cancel_async(G.dev);
@@ -2036,5 +2352,7 @@ int main(int argc, char **argv) {
     netClose();
     if (G.beast_fp && G.beast_fp != stdout) fclose(G.beast_fp);
     else if (G.beast_fp) fflush(stdout);
+    flushEmitterTrain();
+    closeOutputs();
     return 0;
 }
