@@ -992,6 +992,16 @@ static uint32_t uplinkDecodeAddr(uint32_t c)
     return a;
 }
 
+// Selbsttest mit den gemessenen Werten (einmal beim Start aufrufen)
+static bool uplinkAddrSelftest()
+{
+    bool ok = uplinkDecodeAddr(0xAAAC07) == 0xFFFFFF    // Broadcast
+           && uplinkDecodeAddr(0x7FFA56) == 0x4004FE    // MUK6977
+           && uplinkDecodeAddr(0xCBE372) == 0xAE1458;   // RCH313
+    if (!ok) fprintf(stderr, "WARNUNG: Uplink-Adress-Selbsttest fehlgeschlagen\n");
+    return ok;
+}
+
 // Zieladresse aus AP (UF0, UF16 ...): AP XOR CRC(Daten)
 static uint32_t apToAddress(const std::vector<uint8_t>& b)
 {
@@ -1209,7 +1219,7 @@ static int ufLength(uint32_t uf) {
     }
 }
 
-static void printUfFields(const UplinkResult &R) {
+static void printUfFields(const UplinkResult &R, uint64_t pos = 0) {
     const uint8_t *b = R.bytes;
     uint32_t uf = bits(b, 1, 5);
     if ((uf >> 3) == 3) uf = 24;
@@ -1227,10 +1237,16 @@ static void printUfFields(const UplinkResult &R) {
         if (uf == 16 && R.nbits == 112)
             fprintf(G_txt, " MID=%06X", bits(b, 65, 88));
         break;
-    case 4: case 5: case 20: case 21:
+    case 4: case 5: case 20: case 21: {
+        uint32_t di = bits(b, 14, 16);
         fprintf(G_txt, " PC=%u RR=%u DI=%u SD=0x%04X",
-                bits(b, 6, 8), bits(b, 9, 13), bits(b, 14, 16), bits(b, 17, 32));
+                bits(b, 6, 8), bits(b, 9, 13), di, bits(b, 17, 32));
+        if (di == 0 || di == 1 || di == 7)
+            fprintf(G_txt, " II=%u", bits(b, 17, 20));
+        else if (di == 3)
+            fprintf(G_txt, " SI=%u", bits(b, 17, 22));
         break;
+    }
     case 11: {
         uint32_t pr = bits(b, 6, 9), ic = bits(b, 10, 13), cl = bits(b, 14, 16);
         fprintf(G_txt, " PR=%u", pr);
@@ -1247,6 +1263,11 @@ static void printUfFields(const UplinkResult &R) {
     int nd = R.nbits - 24;
     uint32_t ap = bits(b, nd + 1, R.nbits);
     fprintf(G_txt, " APx=%06X", ap ^ modesCrc(b, nd));   // Rohwert (codiert)
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    fprintf(G_txt, " SMP=%llu MONO=%lld.%06ld",
+            (unsigned long long)pos, (long long)ts.tv_sec, ts.tv_nsec / 1000L);
 }
 
 static const char *beamClass(MsgCode c, int p1, int p2, double &db) {
@@ -1281,7 +1302,7 @@ static void analyzeBurst(uint64_t pos, MsgCode code, const uint8_t *m,
                 R->nbits, R->spr_us, R->spr_score, R->mean_margin,
                 R->min_margin, R->weak_bits, R->freq_off_hz / 1e3, R->quality);
         for (int k = 0; k < R->nbits / 8; k++) fprintf(G_txt, "%02X", R->bytes[k]);
-        printUfFields(*R);
+        printUfFields(*R, pos);
     } else if (R && G.uplink_decode) {
         fprintf(G_txt, "\n  [P6] kein Lock (spr=%.2f us score=%.2f)",
                 R->spr_us, R->spr_score);
@@ -1762,6 +1783,7 @@ for (int i = 1; i < argc; i++) {
         } else if (!strcmp(a, "--file")) {
             G.filename = needArg(argc, argv, i);
         } else if (!strcmp(a, "--chan")) {
+	    if (g_haveChan) uplinkAddrSelftest();
             g_haveChan = loadDpskChannel(needArg(argc, argv, i), g_chan);
         } else if (!strcmp(a, "--vcompare")) {
             vcompareLog = needArg(argc, argv, i);
