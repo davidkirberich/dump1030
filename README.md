@@ -15,7 +15,7 @@ Key changes in this fork:
 - **Target ICAO address recovery:** Recovers the 24-bit aircraft address (`AA`) from the AP field for UF0, UF4, UF5, UF16, UF20, UF21, and UF24.
 - **P6 quality gates & JSONL output:** Filters candidates by envelope coverage, SNR, preamble correlation, SPR lock, Viterbi quality (`Q >= 180`), and UF/length validity. Optional `--p6-diagnostics` logs rejected candidates (`P6_REJECTED`) with the failed gate.
 - **Address repetition tracking:** Marks an address with `*` (and sets `status: "repeated"` in JSONL) once seen at least twice within a 60 s window. First sightings remain `status: "candidate"` with `"aa": null`.
-- **Analysis & calibration tools:** Includes `p6sim.py` for channel learning and synthetic benchmarks, plus live monitoring and signature scripts.
+- **Analysis & calibration tools:** Includes `tools/p6sim.py` for channel learning and synthetic benchmarks, plus live monitoring tools.
 
 ## Requirements
 
@@ -31,7 +31,7 @@ apt update && apt install -y build-essential pkg-config librtlsdr-dev
 git clone https://github.com/davidkirberich/dump1030.git
 cd dump1030
 make
-chmod +x dump1030 monitor_p6.py
+chmod +x dump1030 tools/*.py
 ```
 
 ## Quick Start
@@ -45,7 +45,7 @@ chmod +x dump1030 monitor_p6.py
 2. Learn the receiver channel response (only needed once per SDR stick, gain, and sample rate):
 
    ```bash
-   python3 p6sim.py realtest raw_30s.bin --max-sec 5 --chan-out chan.txt
+   python3 tools/p6sim.py realtest raw_30s.bin --max-sec 5 --chan-out chan.txt
    ```
 
 3. Run live with Mode S uplink decoding:
@@ -64,7 +64,7 @@ chmod +x dump1030 monitor_p6.py
    In a second terminal:
 
    ```bash
-   ./monitor_p6.py 'captured/events_*.jsonl'
+   ./tools/monitor_p6.py 'captured/events_*.jsonl'
    ```
 
 ### Output Fields (`--msgs`)
@@ -137,7 +137,7 @@ JSONL `P6` records include `status` (`candidate`, `repeated`, or `mode5`), `q`, 
 Starts a dedicated `dump1030` instance and displays 5-second bar meters (plus session maxima) for Viterbi quality, bit margins, SPR lock, P6 SNR, and SSR activity. Press `r` to reset maxima, `q` to quit.
 
 ```bash
-python3 p6_meter.py --device 1 --gain 32 --chan chan.txt
+python3 tools/p6_meter.py --device 1 --gain 32 --chan chan.txt
 ```
 
 ### `mode-s-meter.py` (1090 MHz Antenna Meter)
@@ -145,7 +145,7 @@ python3 p6_meter.py --device 1 --gain 32 --chan chan.txt
 Reads raw `dump1090`-compatible output and displays 5-second bars for Mode S frames, ICAO counts, repetition, and DF diversity. Press `r` to reset maxima, `q` to quit.
 
 ```bash
-python3 mode-s-meter.py --device 0 --gain 35
+python3 tools/mode-s-meter.py --device 0 --gain 35
 ```
 
 ### `monitor_p6.py` (Live ICAO Monitor)
@@ -155,7 +155,7 @@ python3 mode-s-meter.py --device 0 --gain 35
 Tails JSONL logs in a curses interface without interfering with `dump1030`. Omits `000000` and `FFFFFF`.
 
 ```bash
-python3 monitor_p6.py 'captured/events_*.jsonl'
+python3 tools/monitor_p6.py 'captured/events_*.jsonl'
 ```
 
 Keys: `1` repeated aircraft, `2` II/SI interrogators, `j`/`k` or arrows to navigate, `/` to filter, `c` to clear filter, `Space`/`p` to pause, `:w [path]` to export TSV, `:q` to quit.
@@ -165,9 +165,9 @@ Keys: `1` repeated aircraft, `2` II/SI interrogators, `j`/`k` or arrows to navig
 Generates synthetic P6 recordings, runs Viterbi unit tests, and estimates the receiver channel file (`chan.txt`) from raw I/Q captures.
 
 ```bash
-python3 p6sim.py gen -o sim.bin [--count --snr --bw --df --len --filter fir|iir ...]
-python3 p6sim.py selftest [--part a|b|c|d|e] [--filter fir|iir] [--mem 7]
-python3 p6sim.py realtest raw.bin [--out real.log] [--chan-out chan.txt]
+python3 tools/p6sim.py gen -o sim.bin [--count --snr --bw --df --len --filter fir|iir ...]
+python3 tools/p6sim.py selftest [--part a|b|c|d|e] [--filter fir|iir] [--mem 7]
+python3 tools/p6sim.py realtest raw.bin [--out real.log] [--chan-out chan.txt]
 ```
 
 ### `apx2icao.py` (Offline Log & Parity Analyzer)
@@ -175,7 +175,7 @@ python3 p6sim.py realtest raw.bin [--out real.log] [--chan-out chan.txt]
 Post-processes `--msgs` logs across multiple captures using quality-weighted AP clustering (`--ap-tol`), GF(2) parity checks against ICAO allocation blocks or 1090 MHz `aircraft.json` reference data (`--ref`), and per-bit AP error statistics.
 
 ```bash
-python3 apx2icao.py cap1.log [cap2.log ...] [--ref aircraft.json|dir] \
+python3 tools/apx2icao.py cap1.log [cap2.log ...] [--ref aircraft.json|dir] \
                     [--blocks blocks.csv] [--min-q 180] [--ap-tol 2] [--top 30]
 ```
 
