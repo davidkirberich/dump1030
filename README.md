@@ -2,36 +2,27 @@
 
 **dump1030** is a C++17 command-line receiver that detects and decodes Secondary Surveillance Radar (SSR) interrogations on 1030 MHz using an RTL-SDR.
 
-It detects Mode A, Mode C, Mode A/C All-Call (including Compatibility Mode), and Mode S interrogations. **Mode S (P6/DPSK) uplinks are fully decoded**, including the Uplink Format (UF), all protocol fields, and the **target aircraft ICAO address** recovered from the Address/Parity (AP) field.
-
----
+It detects Mode A, Mode C, Mode A/C All-Call (including Compatibility Mode), and Mode S interrogations. Mode S P6 (DPSK) uplinks are decoded using a 64-state Viterbi equalizer, recovering the Uplink Format (UF), protocol fields, and the 24-bit target ICAO address from the Address/Parity (AP) field.
 
 ## Origin
 
-This project is a fork of [dump1030 by Fuziih](https://github.com/Fuziih/dump1030), which itself builds upon [antirez's dump1090](https://github.com/antirez/dump1090). Many thanks to both authors for laying the groundwork.
+Fork of [dump1030 by Fuziih](https://github.com/Fuziih/dump1030), which builds on [antirez's dump1090](https://github.com/antirez/dump1090).
 
-### What is new in this fork
+Key changes in this fork:
 
-- **Modern C++17 architecture:** Complete rewrite featuring lock-free double buffering, Q8 ratio arithmetic, and precomputed timing tables.
-- **Mode S P6 demodulator:** Sync Phase Reversal (SPR) lock, automatic frame length estimation (56/112 bits), per-frame carrier frequency offset estimation, and `--ppm` tuner correction.
-- **Viterbi / MLSE DPSK decoder:** A 64-state Maximum-Likelihood Sequence Estimator operating on a blindly learned receiver impulse response. Read chapter "**Why a Viterbi Decoder?**" for more information.
-- **Target ICAO address recovery:** Extracts the 24-bit aircraft address (`AA`) via $\text{AA} = \text{AP} \oplus \text{CRC}_{24}(\text{data})$ for UF0, UF16, and related formats.
-- **Conservative P6 acceptance:** Requires a valid uplink format and length, a sufficiently strong and preamble-consistent continuous P6 envelope, and a quality threshold of 180 for Viterbi-decoded frames.
-- **Explicit event status:** JSONL events distinguish `candidate`, `confirmed`, and `mode5`. `aa` remains `null` until the same target address has been seen twice.
-- **Optional P6 diagnostics:** `--p6-diagnostics` records rejected P6 candidates as `P6_REJECTED` JSONL events with the failed acceptance gate and all available metrics.
-- **Temporal address confirmation:** Marks an aircraft address as confirmed (`*`) once it is observed at least twice with no gap longer than 60 seconds between sightings.
-- **Simulation & analysis suite (`p6sim.py`):** Self-contained Python 3 tool (standard library only) for generating synthetic test signals, running decoder benchmarks, and learning the receiver channel response.
-
----
+- **C++17 rewrite:** Double-buffered reader thread, Q8 fixed-point ratio checks, and runtime timing tables.
+- **64-state Viterbi DPSK decoder:** Equalizes 4 Mbit/s Mode S P6 uplinks at 2.5 MS/s using a blindly learned receiver impulse response (`--chan`). Includes automatic 56/112-bit length detection (with 112-bit retry on long UF formats) and 2-pass residual frequency/phase refinement.
+- **Target ICAO address recovery:** Recovers the 24-bit aircraft address (`AA`) from the AP field for UF0, UF4, UF5, UF16, UF20, UF21, and UF24.
+- **P6 quality gates & JSONL output:** Filters candidates by envelope coverage, SNR, preamble correlation, SPR lock, Viterbi quality (`Q >= 180`), and UF/length validity. Optional `--p6-diagnostics` logs rejected candidates (`P6_REJECTED`) with the failed gate.
+- **Address repetition tracking:** Marks an address with `*` (and sets `status: "repeated"` in JSONL) once seen at least twice within a 60 s window. First sightings remain `status: "candidate"` with `"aa": null`.
+- **Analysis & calibration tools:** Includes `p6sim.py` for channel learning and synthetic benchmarks, plus live monitoring and signature scripts.
 
 ## Requirements
 
-- Linux system
-- RTL-SDR dongle capable of streaming stably at $2.5\text{ MS/s}$ tuned to $1030\text{ MHz}$
-- C++17 compiler (`g++`) and `librtlsdr`
-- Python3 (only required for `p6sim.py` during initial channel learning or offline testing)
-
----
+- Linux
+- RTL-SDR capable of streaming stably at 2.5 MS/s on 1030 MHz
+- `g++` (C++17) and `librtlsdr-dev`
+- Python 3 (standard library only; needed for `p6sim.py` and helper scripts)
 
 ## Installation
 
@@ -40,53 +31,47 @@ apt update && apt install -y build-essential pkg-config librtlsdr-dev
 git clone https://github.com/davidkirberich/dump1030.git
 cd dump1030
 make
-chmod +x dump1030
+chmod +x dump1030 monitor_p6.py radar_signatures.py
 ```
-
-*(Note: Ensure the `Makefile` produces the binary named `dump1030`.)*
-
----
 
 ## Quick Start
 
-1. **Record a 30-second raw I/Q capture** ($\approx 150\text{ MB}$):
+1. Record a 30-second raw I/Q capture (~150 MB; adjust `-d` to your device index):
 
    ```bash
-   rtl_sdr -d 1 -f 1030000000 -s 2500000 -g 42 -n 75000000 raw_30s.bin
+   rtl_sdr -d 1 -f 1030000000 -s 2500000 -g 32 -n 75000000 raw_30s.bin
    ```
 
-2. **Learn the receiver channel response.** You only need to repeat this step if you change your RTL-SDR stick, gain setting, or sample rate:
+2. Learn the receiver channel response (only needed once per SDR stick, gain, and sample rate):
 
    ```bash
    python3 p6sim.py realtest raw_30s.bin --max-sec 5 --chan-out chan.txt
    ```
 
-3. **Run live with full Mode S uplink decoding:**
+3. Run live with Mode S uplink decoding:
 
    ```bash
-   ./dump1030 --device 1 --gain 42 --chan chan.txt --uplink-decode --msgs --continuous
+   ./dump1030 --device 1 --gain 32 --chan chan.txt --uplink-decode --msgs --continuous
    ```
 
-   Or process an existing I/Q recording offline:
+4. Run live with JSONL logging and the interactive monitor:
 
    ```bash
-   ./dump1030 --file raw_30s.bin --chan chan.txt --uplink-decode --msgs
+   ./dump1030 --device 1 --gain 32 --chan chan.txt \
+     --uplink-decode --continuous --out-dir ./captured
    ```
 
-### Example Output
+   In a second terminal:
 
-```text
-[P6] 112 Bit spr=0.00 us lock=0.00 margin=1.00/1.00 weak=0 df=-3.3 kHz Q=227 HEX=8080000032000000407B54F95894 UF=16 AA=AAAC07 * RL=1 AQ=0 APx=AAAC07
-```
+   ```bash
+   ./monitor_p6.py 'captured/events_*.jsonl'
+   ```
 
-- **`AA=`** Recovered 24-bit target ICAO address.
-  - **`*`** indicates a **confirmed** address (seen at least twice with no gap longer than $60\text{ s}$ between sightings).
-  - **`?`** indicates a first sighting (or that the previous sighting occurred more than $60\text{ s}$ ago).
-- **`Q=`** Frame quality score ($0\text{–}255$), derived from the normalized Viterbi path metric.
+### Output Fields (`--msgs`)
 
-*Fallback behavior:* If `--chan` is omitted, `dump1030` falls back to legacy per-chip phase slicing. Frame length and Uplink Format (`UF`) remain usable, but payload bits and target addresses will not be reliable.
-
----
+- `AA=` Recovered 24-bit target ICAO address (`*` = repeated within 60 s, `?` = single sighting).
+- `Q=` Frame quality score (`0..255`), derived from the normalized Viterbi path metric.
+- `APx=` Raw encoded address/parity value (`AP ^ CRC24(data)`).
 
 ## Command-Line Options
 
@@ -96,51 +81,39 @@ chmod +x dump1030
 --device <n>            RTL-SDR device index (default: 0)
 --file <path>           Read 8-bit unsigned I/Q samples from file instead of RTL-SDR
 --gain <dB|auto|max>    Tuner gain in dB, "auto", or "max" (default: max)
---samplerate <rate>     Sample rate: 2.4..3.2 MS/s or Hz (default: 2.5). When using --file,
-                        this MUST match the recording's sample rate!
+--samplerate <rate>     Sample rate: 2.4..3.2 MS/s or Hz (default: 2.5). With --file,
+                        must match the recording. --chan requires exactly 2.5 MS/s.
 --ppm <-200..200>       Tuner frequency correction in ppm
 --agc                   Enable RTL2832U digital AGC
---size <bytes>          Read buffer size in bytes (multiple of 16384, min: 16384)
---continuous            Run continuously (--size sets the reporting interval)
+--size <bytes>          Read buffer size in bytes (min: 16384; rounded down to a
+                        multiple of 16384)
+--continuous            Run continuously (--size is the block size and reporting interval)
 ```
 
-### Mode S Uplink Decoding
+### Mode S Uplink Decoding & Output
 
 ```text
---uplink-decode         Enable Mode S P6 (DPSK) uplink demodulation
---chan <path>           Load learned receiver channel file (enables Viterbi decoder)
+--uplink-decode         Enable Mode S P6 (DPSK) uplink decoding (requires --chan)
+--chan <path>           Load learned receiver channel file
+--out-dir <path>        Directory for JSONL event logs (and optional .cu8 captures)
+--save-iq               Save raw I/Q stream (.cu8), requires --out-dir
+--p6-diagnostics        Log rejected P6 candidates as P6_REJECTED
+                        (requires --out-dir and --uplink-decode)
+--p6-quality <0..255>   Minimum Viterbi quality score (default: 180)
+--p6-coverage <0..1>    Minimum P6 envelope coverage (default: 0.65)
+--p6-snr <dB>           Minimum P6 SNR in dB (default: 6.0)
+--p6-pre-snr <dB>       Minimum preamble SNR in dB (default: 3.0)
+--p6-p1-ratio <r>       Maximum P6/P1 amplitude ratio (default: 4.0)
+--p6-rho <0..1>         Minimum preamble correlation (default: 0.50)
+--p6-lock <0..1>        Minimum SPR lock score (default: 0.50)
+--p6-timing-radius <n>  Viterbi fine-timing search radius in 20 MS/s steps (0..8, default: 1)
 --msgs                  Print decoded interrogations with sample details
---p6-diagnostics        Write rejected P6 candidates to JSONL (requires --out-dir)
-```
-
-The blind channel model uses the 2.5 MS/s time grid learned by `p6sim.py`.
-`--chan` therefore requires `--samplerate 2.5` (the default); other sample
-rates are intentionally rejected for that decoder.
-
-P6 JSONL output includes `status` (`candidate`, `confirmed`, or `mode5`),
-`p6snr_db`, `pre_snr_db`, and `p6_p1_ratio`. An
-unconfirmed address is represented by `"aa":null` together with its
-`aa_cnt`; it is not an externally verified aircraft identification.
-Mode-5 classification is determined independently for each decoded payload;
-neighboring interrogations cannot suppress an ICAO address by sharing a time
-slot with a Mode-5 message.
-
-With `--p6-diagnostics`, rejected candidates are additionally written as
-`type:"P6_REJECTED"`. The `reason` identifies the first failed gate, for
-example `p6_snr`, `preamble_snr`, `p6_p1_ratio`, `preamble_rho`,
-`spr_lock`, `viterbi_quality`, or `uplink_format`. This diagnostic stream makes gate tuning measurable without
-storing raw I/Q data.
-
-### Debugging & Verification
-
-```text
---vcompare <log>        Decode frames listed in a p6sim log using C++ and compare
-                        bit-by-bit against Python (requires --file and --chan)
---spr-offset <us>       Manually shift the SPR lock point in microseconds (debug only)
---print                 Print all raw magnitude values (very slow)
 --order                 Print sequence order of detected interrogation types
+--print                 Print all raw magnitude values (very slow)
 --help                  Display help message
 ```
+
+JSONL `P6` records include `status` (`candidate`, `repeated`, or `mode5`), `q`, `viterbi_metric`, `path_metric_gap`, `mean_margin`, `min_margin`, `data_min_margin`, `ap_min_margin`, `p6snr_db`, `pre_snr_db`, `p6_p1_ratio`, and format-specific fields (`ii`/`si`, `pr`, `ic`, `cl`, `pc`, `rr`, `di`, `sd`, `rl`, `aq`, `ds`, `mid`, `rc`, `nc`).
 
 ### Pulse Detector Tuning (Legacy Options)
 
@@ -157,92 +130,84 @@ storing raw I/Q data.
 --blmode                      Print baseline values for mpa/mnf/mnfc
 ```
 
-*(See the original `dump1030` documentation for tuning details; not all threshold flags are mutually compatible.)*
-
----
-
 ## Tools
 
-### `monitor_p6.py` Live ICAO Monitor
+### `p6_meter.py` (1030 MHz Antenna Meter)
+
+Starts a dedicated `dump1030` instance and displays 5-second bar meters (plus session maxima) for Viterbi quality, bit margins, SPR lock, P6 SNR, and SSR activity. Press `r` to reset maxima, `q` to quit.
+
+```bash
+python3 p6_meter.py --device 1 --gain 32 --chan chan.txt
+```
+
+### `mode-s-meter.py` (1090 MHz Antenna Meter)
+
+Reads raw `dump1090`-compatible output and displays 5-second bars for Mode S frames, ICAO counts, repetition, and DF diversity. Press `r` to reset maxima, `q` to quit.
+
+```bash
+python3 mode-s-meter.py --device 0 --gain 35
+```
+
+### `monitor_p6.py` (Live ICAO Monitor)
 
 ![Screenshot of monitor_p6.py in action](img/monitor_p6.png)
 
-`monitor_p6.py` follows JSONL output independently from `dump1030`. It aggregates
-confirmed ICAO addresses and does not modify or control the recording process:
+Tails JSONL logs in a curses interface without interfering with `dump1030`. Omits `000000` and `FFFFFF`.
 
 ```bash
 python3 monitor_p6.py 'captured/events_*.jsonl'
 ```
 
-By default it follows `captured/events_*.jsonl`. The curses interface updates
-in place and supports `j`/`k` or arrow-key selection, `/` for filtering, `c` to
-clear the filter, and Space or `p` to pause the display while copying text.
-Use `:q` or `Ctrl+C` to quit, or `:w [path]` to export the current view as TSV.
-The values `000000` and `FFFFFF` are omitted because they are not usable
-aircraft addresses.
+Keys: `1` repeated aircraft, `2` II/SI interrogators, `j`/`k` or arrows to navigate, `/` to filter, `c` to clear filter, `Space`/`p` to pause, `:w [path]` to export TSV, `:q` to quit.
 
-### `p6sim.py` Simulator & Channel Estimator
+### `radar_signatures.py` (Rotation & Burst Analysis)
 
-`p6sim.py` is a companion Python tool for testing and channel calibration:
+Estimates recurring radar rotation periods (4.8..5.2 s) and phases directly from 1030 MHz JSONL logs, with harmonic rejection and optional drift windows for moving emitters.
+
+```bash
+python3 radar_signatures.py 'captured/events_*.jsonl'
+python3 radar_signatures.py 'captured/events_*.jsonl' --channel p6 --json
+python3 radar_signatures.py 'captured/events_*.jsonl' --channel p6 --duration-s 3600 --explore
+```
+
+Channels: `civil` (default: SSR + P6 UF4/5/11/20/21), `mode5`, `acas` (UF0/16), `p6` (all accepted P6). `--explore` outputs inter-event gaps, 55 ms burst shapes, burst families, and DF/P1 drift statistics without assuming a fixed rotation period.
+
+### `p6sim.py` (Simulator & Channel Estimator)
+
+Generates synthetic P6 recordings, runs Viterbi unit tests, and estimates the receiver channel file (`chan.txt`) from raw I/Q captures.
 
 ```bash
 python3 p6sim.py gen -o sim.bin [--count --snr --bw --df --len --filter fir|iir ...]
-python3 p6sim.py compare sim.truth sim.log
 python3 p6sim.py selftest [--part a|b|c|d|e] [--filter fir|iir] [--mem 7]
 python3 p6sim.py realtest raw.bin [--out real.log] [--chan-out chan.txt]
 ```
 
-- **`gen`** Synthesizes realistic P6 DPSK recordings with ground-truth logs.
-- **`selftest`** Runs unit tests on the Viterbi decoder (ideal channel, memory depth, model mismatch, channel estimation, and blind decoding).
-- **`realtest`** Detects and decodes frames in raw I/Q captures, estimates the receiver channel (`--chan-out`), and prints AP field statistics.
+### `apx2icao.py` (Offline Log & Parity Analyzer)
 
----
-
-### `apx2icao.py` Offline Log & Parity Analyzer
-
-`apx2icao.py` is an offline analysis script (Python 3, standard library only) for post-processing `--msgs` capture logs. While `dump1030` already recovers and confirms target ICAO addresses in real time[cite: 3], `apx2icao.py` provides deeper statistical verification across multiple log files:
+Post-processes `--msgs` logs across multiple captures using quality-weighted AP clustering (`--ap-tol`), GF(2) parity checks against ICAO allocation blocks or 1090 MHz `aircraft.json` reference data (`--ref`), and per-bit AP error statistics.
 
 ```bash
 python3 apx2icao.py cap1.log [cap2.log ...] [--ref aircraft.json|dir] \
                     [--blocks blocks.csv] [--min-q 180] [--ap-tol 2] [--top 30]
 ```
 
-- **Quality-weighted clustering:** Groups identical payloads and merges AP fields within a configurable Hamming tolerance (`--ap-tol`), resolving bit errors via quality-weighted majority voting[cite: 2].
-- **GF(2) parity verification:** Tests invertible linear parity hypotheses ($X = \text{AP} \oplus \text{CRC}_{24}(\text{data})$) against known regional ICAO allocation blocks and optional 1090 MHz receiver reference data (`--ref`, e.g., `aircraft.json` or OpenSky exports)[cite: 2].
-- **Diagnostics:** Reports TCAS interrogation intervals ($\sim 1\text{ s}$) and per-bit AP error rates across repeated frames[cite: 2].
+## Why a Viterbi Decoder?
 
----
+Mode S uplinks use 4 Mbit/s DPSK (0.25 us per chip). At an RTL-SDR sample rate of 2.5 MS/s, the tuner low-pass filter smears adjacent chips into each other (inter-symbol interference). Simple per-chip phase slicing produces ~20..25% bit errors and almost no error-free frames.
+
+`dump1030` solves this with Maximum-Likelihood Sequence Estimation (MLSE):
+
+1. **Blind channel identification:** `p6sim.py` estimates the combined tuner and filter impulse response from real off-air recordings using decision feedback and least-squares fitting.
+2. **Per-frame synchronization:** Timing, carrier phase, and amplitude are fitted against the known preamble (`P1`/`P2`, start of `P6`, SPR), while the carrier frequency offset is estimated from squared differential phases and refined in a second pass against the reconstructed P6 model.
+3. **Sequence decoding:** A 64-state Viterbi decoder (7-chip channel memory) finds the most likely bit sequence for the measured channel response.
 
 ## Known Limitations
 
-- **USB sample drops:** Some RTL-SDR dongles and USB host controllers drop samples even at $2.5\text{ MS/s}$. Higher sample rates are not supported.
-- **Detector sensitivity:** The real-time C++ pulse detector currently triggers on fewer weak P6 frames than the offline Python detector in `p6sim.py`.
-- **Single sightings (`?`):** Addresses marked `?` may contain residual bit errors from noise bursts or weak signals. Rely on confirmed addresses (`*`). Aircraft interrogated less frequently than once every $60\text{ s}$ will remain marked `?`.
-- **Hardware-specific channel file:** Always regenerate `chan.txt` if you swap your SDR dongle, change the tuner gain, or alter the sample rate.
-- **UF16 payload:** The `MU` (Message, Uplink) field of UF16 ACAS frames is extracted as raw hex, not parsed into individual TCAS resolution advisory subfields.
-
----
-
-## Why a Viterbi Decoder?
-
-Mode S uplink data is modulated using Differential Phase Shift Keying (DPSK) at a chip rate of $4\text{ Mchips/s}$ ($0.25\text{ }\mu\text{s}$ per chip). At a standard RTL-SDR sample rate of $2.5\text{ MS/s}$, the tuner's low-pass filter bandwidth is narrow enough that an isolated chip between two phase reversals is heavily smeared across adjacent samples (inter-symbol interference).
-
-Simple chip-by-chip phase slicing fails under these conditions, yielding roughly $20\text{–}25\%$ bit errors and virtually zero error-free frames. **dump1030** overcomes this with Maximum-Likelihood Sequence Estimation (MLSE):
-
-1. **Blind channel identification:** The combined impulse response of the tuner and anti-aliasing filter is learned *blindly* from real off-air recordings using decision feedback and least-squares estimation. This calibration needs to be performed only once per hardware/gain/sample-rate setup.
-2. **Per-frame synchronization:** For each detected interrogation, timing, carrier phase, and amplitude are estimated by fitting the known preamble ($P_1/P_2$, start of $P_6$, and SPR). The carrier frequency offset is estimated separately from the DPSK data chips inside $P_6$ by squaring the phase differences of consecutive samples, which removes the data-dependent $180^\circ$ phase reversals.
-3. **Sequence decoding:** A 64-state Viterbi decoder (7-chip channel memory) finds the most likely transmitted bit sequence given the measured channel response.
-
-### Validation
-
-- **Synthetic benchmarks:** $100\%$ error-free frames in `p6sim.py`, including blind tests with unknown, non-linear-phase IIR filters.
-- **Off-air recordings:**
-  - Decoded AP fields match uniform 24-bit address distributions.
-  - Aircraft addresses are repeatedly confirmed by *distinct* interrogation payloads resolving to the exact same ICAO address.
-  - Periodic $\sim 1\text{ s}$ TCAS interrogation intervals are clearly visible.
-- **C++ vs. Python parity:** $100.00\%$ bit-identical output across 1,209 real off-air frames ($0.0000\%$ bit discrepancy).
-
----
+- **USB sample drops:** Some RTL-SDR sticks and USB controllers drop samples at 2.5 MS/s; higher sample rates are not supported with `--chan`.
+- **Detector sensitivity:** The real-time C++ pulse detector triggers on fewer weak P6 frames than the offline Python detector in `p6sim.py`.
+- **No independent uplink CRC:** Mode S uplinks XOR the 24-bit ICAO address into the CRC, so any single bit error produces a different valid-looking address. Repetition (`*`) is therefore used as a confidence indicator, not external verification.
+- **Hardware-specific channel file:** Regenerate `chan.txt` whenever you change the SDR stick or gain setting.
+- **UF16 payload:** The `MU` field of UF16 ACAS frames is logged as raw hex, not parsed into individual TCAS subfields.
 
 ## License
 
