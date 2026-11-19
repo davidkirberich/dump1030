@@ -756,6 +756,8 @@ def rt_stats(label, rows):
 def cmd_realtest(args):
     t0 = time.time()
     data = open(args.file, 'rb').read()
+    if not data:
+        raise SystemExit('Keine IQ-Daten in der Eingabedatei; Abbruch.')
     hits, thr = rt_detect(data, int(args.max_sec * 2.5e6), args.thr)
     frames = []
     for k in hits:
@@ -765,6 +767,10 @@ def cmd_realtest(args):
     dfs = sorted(f[3] for f in frames)
     print('Frames %d (112 Bit: %d)  df-Median %.2f kHz'
           % (len(frames), sum(1 for f in frames if f[2] == 112), dfs[len(dfs) // 2] / 1000 if dfs else 0))
+    if not frames:
+        raise SystemExit(
+            'Keine gueltigen P6-Kandidaten; Kanaldatei wurde nicht geschrieben.'
+        )
     rx = st_model(args.start, args.start_bw)
     L = args.mem
     for rnd in range(args.rounds):
