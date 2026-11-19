@@ -9,10 +9,15 @@
 #include <cmath>
 #include <complex>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
+#include <limits>
+#include <string>
+#include <unordered_map>
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
@@ -146,12 +151,13 @@ struct UplinkResult {
     bool    valid = false;
     int     nbits = 0;           // 56 oder 112
     uint8_t bytes[14] = {0};
-    float   margin[112] = {0};   // |cos dphi| pro Bit
+    float   margin[112] = {0};   // Phasen-/Pfadkonfidenz je Bit
     double  spr_us = 0.0;        // gelockter SPR-Zeitpunkt
     double  spr_score = 0.0;     // 0..1, Schaerfe des Locks
-    double  mean_margin = 0.0;   // mittl. |cos dphi| der Bitentscheidungen
+    double  mean_margin = 0.0;   // mittlere Bitkonfidenz
     double  min_margin = 0.0;    // schlechteste Bitentscheidung
-    int     weak_bits = 0;       // Bits mit |cos dphi| < 0,3
+    double  decoder_metric = 0.0;// mittlere Viterbi-Modellabweichung
+    double  path_metric_gap = -1.0;
     double  freq_off_hz = 0.0;   // geschaetzter Frequenzoffset
     uint8_t quality = 0;         // 0..255, kombiniert
     uint32_t addr = 0;
@@ -206,13 +212,21 @@ struct State {
     bool     continuous = false;
     bool     uplink_decode = false;
     bool     p6_diagnostics = false;
+    int      p6_min_quality = 180;
+    double   p6_min_snr_db = 6.0;
+    double   p6_min_pre_snr_db = 3.0;
+    double   p6_max_p1_ratio = 4.0;
+    double   p6_min_coverage = 0.65;
+    double   p6_min_rho = 0.50;
+    double   p6_min_lock = 0.50;
+    int      p6_timing_radius = 1;
     const char *filename = nullptr;
 
     // Statistik
     Counters cur, cum;
     Average  avg_pulse, avg_nf, avg_nfc;
     double   last_burst_us = -1.0;
-    uint64_t uplink_ok = 0, uplink_weak = 0;
+    uint64_t uplink_ok = 0;
 
     // RTL-SDR / Datei
     rtlsdr_dev_t *dev = nullptr;
@@ -304,6 +318,9 @@ static double monotonicSec() {
 }
 
 static inline uint32_t ufOf(const uint8_t *b);
+static inline bool hasAircraftAddress(uint32_t uf, int nbits);
+static uint32_t apToAddressBytes(const uint8_t* bytes, int nbits);
+static int formatP6ProtocolJson(const UplinkResult& R, char *out, size_t size);
 
 static void writeJsonlP6(uint64_t smp, int p1, int p2, const UplinkResult& R) {
     if (!G.jsonl_fp || !R.valid) return;
@@ -322,21 +339,37 @@ static void writeJsonlP6(uint64_t smp, int p1, int p2, const UplinkResult& R) {
     double snr_db = (p2 > 0 && p1 > 0) ? 20.0 * log10((double)p1 / (double)p2) : 0.0;
 
     const char *status = R.mode5 ? "mode5"
-                       : (R.has_addr && R.addrCnt >= 2) ? "confirmed" : "candidate";
+                       : (R.has_addr && R.addrCnt >= 2) ? "repeated" : "candidate";
+    double data_min_margin = 1.0;
+    double ap_min_margin = 1.0;
+    for (int b = 0; b < R.nbits; ++b) {
+        double &target = (b < R.nbits - 24)
+                       ? data_min_margin : ap_min_margin;
+        target = std::min(target, (double)R.margin[b]);
+    }
+    char protocol_json[384];
+    formatP6ProtocolJson(R, protocol_json, sizeof(protocol_json));
 
     fprintf(G.jsonl_fp,
         "{\"type\":\"P6\",\"smp\":%llu,\"mono\":%.6f,\"uf\":%d,\"mode5\":%s,\"nbits\":%d,"
         "\"p1\":%d,\"p2\":%d,\"snr_db\":%.2f,\"df_hz\":%.1f,"
         "\"spr_us\":%.3f,\"lock\":%.3f,\"cov\":%.3f,\"p6min\":%.3f,"
         "\"p6snr_db\":%.2f,\"pre_snr_db\":%.2f,\"p6_p1_ratio\":%.2f,"
-        "\"rho\":%.3f,\"q\":%u,\"status\":\"%s\","
+        "\"rho\":%.3f,\"q\":%u,\"viterbi_metric\":%.6f,"
+        "\"mean_margin\":%.4f,\"min_margin\":%.4f,"
+        "\"data_min_margin\":%.4f,\"ap_min_margin\":%.4f,"
+        "\"path_metric_gap\":%.6f%s,\"status\":\"%s\","
         "\"aa\":%s,\"aa_cnt\":%u,\"hex\":\"%s\"}\n",
         (unsigned long long)smp, monotonicSec(),
         (int)ufOf(R.bytes), R.mode5 ? "true" : "false", R.nbits,
         p1, p2, snr_db, R.freq_off_hz,
         R.spr_us, R.spr_score, R.p6_cov, R.p6_min_ratio, R.p6_snr_db,
-        R.pre_snr_db, R.p6_p1_ratio, R.pre_rho, (unsigned)R.quality, status, aa_json,
-        (!R.mode5 && R.has_addr) ? (unsigned)R.addrCnt : 0u, hex);
+        R.pre_snr_db, R.p6_p1_ratio, R.pre_rho, (unsigned)R.quality,
+        R.decoder_metric, R.mean_margin, R.min_margin, data_min_margin,
+        ap_min_margin, R.path_metric_gap, protocol_json,
+        status, aa_json,
+        (!R.mode5 && R.has_addr)
+            ? (unsigned)R.addrCnt : 0u, hex);
     fflush(G.jsonl_fp);
 }
 
@@ -367,12 +400,14 @@ static void writeJsonlP6Reject(uint64_t smp, int p1, int p2,
         "\"snr_db\":%.2f,\"df_hz\":%.1f,\"spr_us\":%.3f,\"lock\":%.3f,"
         "\"cov\":%.3f,\"p6min\":%.3f,\"p6snr_db\":%.2f,"
         "\"pre_snr_db\":%.2f,\"p6_p1_ratio\":%.2f,\"rho\":%.3f,"
-        "\"q\":%u,\"hex\":\"%s\"}\n",
+        "\"q\":%u,\"viterbi_metric\":%.6f,\"mean_margin\":%.4f,"
+        "\"min_margin\":%.4f,\"hex\":\"%s\"}\n",
         (unsigned long long)smp, monotonicSec(),
         R.reject_reason ? R.reject_reason : "unknown",
         uf, R.nbits, p1, p2, snr_db, R.freq_off_hz, R.spr_us,
         R.spr_score, R.p6_cov, R.p6_min_ratio, R.p6_snr_db,
-        R.pre_snr_db, R.p6_p1_ratio, R.pre_rho, (unsigned)R.quality, hex);
+        R.pre_snr_db, R.p6_p1_ratio, R.pre_rho, (unsigned)R.quality,
+        R.decoder_metric, R.mean_margin, R.min_margin, hex);
     fflush(G.jsonl_fp);
 }
 
@@ -575,48 +610,6 @@ static inline bool getIQSample(double t, cd &out) {
     return true;
 }
 
-// ---------- Frequenzoffset ----------
-struct FreqEst {
-    bool   ok = false;
-    double w  = 0.0;          // rad pro Sample
-    double hz = 0.0;
-    double coherence = 0.0;   // 0..1, Guete der Schaetzung
-};
-
-static FreqEst estimateFreqOffset(int i) {
-    FreqEst fe;
-    const Timing &T = G.tm;
-    int a = i + (int)std::ceil(T.f(3.6));
-    int b = i + (int)std::floor(T.f(4.6));
-    if (a < 0 || b >= (int)g_valid_samples || b - a < 2) return fe;
-
-    cd acc = 0.0;
-    double norm = 0.0;
-    for (int k = a; k < b; k++) {
-        cd d = iqAt(k + 1) * std::conj(iqAt(k));
-        double ad = std::abs(d);
-        if (ad < 1e-9) continue;
-        acc  += d * d / ad;
-        norm += ad;
-    }
-    if (norm <= 0.0) return fe;
-    fe.coherence = std::abs(acc) / norm;
-    fe.w  = std::arg(acc) / 2.0;
-    fe.hz = fe.w * G.samplerate / (2.0 * PI);
-    fe.ok = fe.coherence > 0.5 && std::fabs(fe.hz) < 150e3;
-    if (!fe.ok) { fe.w = 0.0; }
-    return fe;
-}
-
-static inline bool diffCos(double ta, double tb, double w, double &c) {
-    cd za, zb;
-    if (!getIQSample(ta, za) || !getIQSample(tb, zb)) return false;
-    cd d = zb * std::conj(za) * std::polar(1.0, -w * (tb - ta));
-    double n = std::abs(za) * std::abs(zb);
-    c = (n > 1e-9) ? d.real() / n : 0.0;
-    return true;
-}
-
 // ---------- Sync Phase Reversal (SPR) Lock ----------
 struct WinSum { cd z = 0.0; double mag = 0.0; int n = 0; };
 
@@ -706,20 +699,8 @@ static int estimateLength(int i, int p1_ref) {
     return (tail > 0.5 * ref) ? 112 : 56;
 }
 
-static const double WEAK_MARGIN = 0.3;
-static constexpr int MIN_VITERBI_QUALITY = 180;
-static constexpr double MIN_P6_SNR_DB = 6.0;
-static constexpr double MIN_PREAMBLE_SNR_DB = 3.0;
-static constexpr double MAX_P6_TO_P1_RATIO = 4.0;
-
 // ===================== Viterbi-DPSK (Paket 1) =====================
 // Zeitachse wie p6sim: 20-MS/s-Index, P1-Vorderflanke = 160, Datenchip j ab anchor + 5*j
-#include <vector>
-#include <complex>
-#include <cmath>
-#include <cstdint>
-#include <limits>
-#include <algorithm>
 
 struct DpskChannel {
     std::vector<float> g0;   // Antwort auf Einheitschip j=0 (20 MS/s)
@@ -739,7 +720,11 @@ struct DpskChannel {
 
 struct ViterbiResult {
     std::vector<uint8_t> bits;
+    std::vector<float> margin;
     float metric = 0.f;      // mittlerer quadratischer Fehler pro Sample
+    float path_metric_gap = -1.f;
+    double residual_w = 0.0;
+    double residual_coherence = 0.0;
     int   nsamp  = 0;
 };
 
@@ -767,57 +752,237 @@ ViterbiResult viterbiDpsk(const DpskChannel& ch, const std::complex<float>* r, i
     }
 
     // Zustand: letzte 6 Chips, Bit 0 = jüngster, 1 = +1, 0 = -1
+    constexpr int K = 2;
     const float INF = std::numeric_limits<float>::infinity();
-    std::vector<float> met(S, INF), nmet(S);
-    std::vector<uint8_t> tb((size_t)N * S);                // Vorgängerzustand
+    std::vector<float> met(S * K, INF), nmet(S * K);
+    std::vector<float> margin(N, 0.f);
+    std::vector<uint16_t> tb((size_t)N * S * K);            // Vorgängerpfad
+    std::vector<float> forward((size_t)(N + 1) * S, INF);
     met[0] = 0.f;                                          // nach SPR: alle -1
+    forward[0] = 0.f;
+
+    auto branchMetric = [&](int j, int st, int cb) {
+        if (j >= n && cb != (st & 1)) return INF;
+        float metric = 0.f;
+        for (const Smp& s : by[j]) {
+            float v = s.kv;
+            for (int i = 0; i < L; ++i) {
+                int d = j - (s.w + i);
+                if (d < 0) continue;
+                int bit = (d == 0) ? cb : (st >> (d - 1)) & 1;
+                v += bit ? s.B[i] : -s.B[i];
+            }
+            metric += std::norm(s.z - v);
+        }
+        return metric;
+    };
 
     for (int j = 0; j < N; ++j) {
         std::fill(nmet.begin(), nmet.end(), INF);
-        uint8_t* tbj = &tb[(size_t)j * S];
+        uint16_t* tbj = &tb[(size_t)j * S * K];
         for (int st = 0; st < S; ++st) {
-            if (met[st] == INF) continue;
-            for (int cb = 0; cb < 2; ++cb) {
-                if (j >= n && cb != (st & 1)) continue;    // Guard: keine Umkehr
-                float m = met[st];
-                for (const Smp& s : by[j]) {
-                    float v = s.kv;
-                    for (int i = 0; i < L; ++i) {
-                        int d = j - (s.w + i);             // 0 = aktueller Chip
-                        if (d < 0) continue;
-                        int bit = (d == 0) ? cb : (st >> (d - 1)) & 1;
-                        v += bit ? s.B[i] : -s.B[i];
+            for (int rank = 0; rank < K; ++rank) {
+                const float prior = met[st * K + rank];
+                if (prior == INF) continue;
+                for (int cb = 0; cb < 2; ++cb) {
+                    const float branch = branchMetric(j, st, cb);
+                    if (!std::isfinite(branch)) continue;
+                    float m = prior + branch;
+                    int nst = ((st << 1) | cb) & (S - 1);
+                    int slot = nst * K;
+                    int insert = K;
+                    for (int rank_out = 0; rank_out < K; ++rank_out) {
+                        if (m < nmet[slot + rank_out]) {
+                            insert = rank_out;
+                            break;
+                        }
                     }
-                    m += std::norm(s.z - v);
+                    if (insert < K) {
+                        for (int shift = K - 1; shift > insert; --shift) {
+                            nmet[slot + shift] = nmet[slot + shift - 1];
+                            tbj[slot + shift] = tbj[slot + shift - 1];
+                        }
+                        nmet[slot + insert] = m;
+                        tbj[slot + insert] = (uint16_t)(st * K + rank);
+                    }
                 }
-                int nst = ((st << 1) | cb) & (S - 1);
-                if (m < nmet[nst]) { nmet[nst] = m; tbj[nst] = (uint8_t)st; }
             }
+        }
+        for (int st = 0; st < S; ++st) {
+            forward[(size_t)(j + 1) * S + st] = nmet[st * K];
         }
         met.swap(nmet);
     }
 
-    int best = 0;
-    for (int st = 1; st < S; ++st) if (met[st] < met[best]) best = st;
-
-    std::vector<int8_t> chip(N);
-    for (int j = N - 1, st = best; j >= 0; --j) {
-        chip[j] = (st & 1) ? 1 : -1;
-        st = tb[(size_t)j * S + st];
+    std::vector<float> backward((size_t)(N + 1) * S, INF);
+    for (int st = 0; st < S; ++st) {
+        backward[(size_t)N * S + st] = 0.f;
     }
+    for (int j = N - 1; j >= 0; --j) {
+        for (int st = 0; st < S; ++st) {
+            for (int cb = 0; cb < 2; ++cb) {
+                const float branch = branchMetric(j, st, cb);
+                if (!std::isfinite(branch)) continue;
+                const int nst = ((st << 1) | cb) & (S - 1);
+                const float candidate =
+                    branch + backward[(size_t)(j + 1) * S + nst];
+                backward[(size_t)j * S + st] = std::min(
+                    backward[(size_t)j * S + st], candidate
+                );
+            }
+        }
+    }
+    for (int j = 0; j < n; ++j) {
+        float metric0 = INF, metric1 = INF;
+        for (int st = 0; st < S; ++st) {
+            const float prior = forward[(size_t)j * S + st];
+            if (!std::isfinite(prior)) continue;
+            for (int cb = 0; cb < 2; ++cb) {
+                const float branch = branchMetric(j, st, cb);
+                if (!std::isfinite(branch)) continue;
+                const int nst = ((st << 1) | cb) & (S - 1);
+                const float candidate =
+                    prior + branch
+                    + backward[(size_t)(j + 1) * S + nst];
+                if ((cb != (st & 1)) == 0) {
+                    metric0 = std::min(metric0, candidate);
+                } else {
+                    metric1 = std::min(metric1, candidate);
+                }
+            }
+        }
+        const float best_metric = std::min(metric0, metric1);
+        if (std::isfinite(best_metric)) {
+            margin[j] = std::min(
+                1.f,
+                std::fabs(metric1 - metric0)
+                    / std::max(1.f, best_metric)
+            );
+        }
+    }
+
+    int best = 0, second = -1;
+    for (int path = 1; path < S * K; ++path) {
+        if (met[path] < met[best]) {
+            second = best;
+            best = path;
+        } else if (second < 0 || met[path] < met[second]) {
+            second = path;
+        }
+    }
+
+    auto traceback = [&](int final_path) {
+        std::vector<int8_t> chip(N);
+        for (int j = N - 1, path = final_path; j >= 0; --j) {
+            const int st = path / K;
+            chip[j] = (st & 1) ? 1 : -1;
+            path = tb[(size_t)j * S * K + path];
+        }
+        return chip;
+    };
+    const std::vector<int8_t> chip = traceback(best);
 
     ViterbiResult res;
     res.nsamp  = ns;
     res.metric = met[best] / std::max(1, ns);
+    std::vector<double> phase_x;
+    std::vector<double> phase_y;
+    std::vector<double> phase_weights;
+    for (int k = 0; k < nr; ++k) {
+        double t = off + 8.0 * k;
+        int jc = (int)std::floor((t - ch.delay - ch.anchor) / 5.0);
+        int w = jc - H, e = w + L - 1;
+        if (e < 0 || w > N - 1) continue;
+        std::complex<double> residual_model = ch.knv(t);
+        for (int i = 0; i < L; ++i) {
+            int m = w + i;
+            if (m < 0 || m >= N) continue;
+            residual_model += static_cast<double>(chip[m]) * ch.g(m, t);
+        }
+        residual_model *=
+            static_cast<double>(A) * std::polar(1.0, (double)phi);
+        if (std::abs(residual_model) < 1e-9) continue;
+        std::complex<double> phase = std::complex<double>(r[k])
+            * std::conj(residual_model);
+        phase_x.push_back((double)k);
+        phase_y.push_back(std::arg(phase));
+        phase_weights.push_back(std::abs(phase));
+    }
+    if (phase_x.size() >= 4) {
+        double weight = 0.0, sx = 0.0, sy = 0.0;
+        std::complex<double> lag = 0.0;
+        double lag_weight = 0.0;
+        for (size_t k = 1; k < phase_y.size(); ++k) {
+            const double w = std::sqrt(phase_weights[k - 1] * phase_weights[k]);
+            lag += w * std::polar(
+                1.0, phase_y[k] - phase_y[k - 1]
+            );
+            lag_weight += w;
+        }
+        const double lag_dx = std::max(
+            1.0, phase_x.back() - phase_x.front()
+        ) / std::max<size_t>(1, phase_x.size() - 1);
+        const double predicted_w = lag_weight > 1e-12
+            ? std::arg(lag) / lag_dx
+            : 0.0;
+        const double x0 = phase_x.front();
+        std::complex<double> intercept = 0.0;
+        for (size_t k = 0; k < phase_y.size(); ++k) {
+            intercept += phase_weights[k] * std::polar(
+                1.0, phase_y[k] - predicted_w * (phase_x[k] - x0)
+            );
+        }
+        const double phase0 = std::arg(intercept);
+        for (size_t k = 0; k < phase_y.size(); ++k) {
+            double predicted =
+                phase0 + predicted_w * (phase_x[k] - x0);
+            double delta = predicted - phase_y[k];
+            phase_y[k] += 2.0 * M_PI
+                * std::round(delta / (2.0 * M_PI));
+        }
+        for (size_t k = 0; k < phase_x.size(); ++k) {
+            double w = phase_weights[k];
+            weight += w;
+            sx += w * phase_x[k];
+            sy += w * phase_y[k];
+        }
+        if (weight > 0.0) {
+            double x_mean = sx / weight, y_mean = sy / weight;
+            double numerator = 0.0, denominator = 0.0, energy = 0.0;
+            for (size_t k = 0; k < phase_x.size(); ++k) {
+                double dx = phase_x[k] - x_mean;
+                double dy = phase_y[k] - y_mean;
+                double w = phase_weights[k];
+                numerator += w * dx * dy;
+                denominator += w * dx * dx;
+                energy += w * dy * dy;
+            }
+            if (denominator > 0.0) {
+                res.residual_w = numerator / denominator;
+                double explained = numerator * numerator /
+                    std::max(1e-12, denominator);
+                res.residual_coherence = std::max(
+                    0.0, std::min(1.0, explained /
+                        std::max(1e-12, energy))
+                );
+            }
+        }
+    }
+    if (second >= 0) {
+        res.path_metric_gap =
+            (met[second] - met[best]) / std::max(1, ns);
+    }
+    res.margin.resize(n);
+    for (int j = 0; j < n; ++j) res.margin[j] = margin[j];
     res.bits.resize(n);
     int prev = -1;
-    for (int j = 0; j < n; ++j) { res.bits[j] = (chip[j] != prev); prev = chip[j]; }
+    for (int j = 0; j < n; ++j) {
+        res.bits[j] = (chip[j] != prev);
+        prev = chip[j];
+    }
     return res;
 }
 // =================== Ende Viterbi-DPSK ===================
-
-#include <fstream>
-#include <string>
 
 DpskChannel g_chan;
 bool g_haveChan = false;
@@ -844,9 +1009,6 @@ bool loadDpskChannel(const char* path, DpskChannel& ch)
 }
 
 // ===================== Blind-Decode (Paket 3) =====================
-#include <cstdio>
-#include <sstream>
-
 constexpr int BD_WIN = 125;          // Fenster ab 20 Samples (8 µs) vor P1
 
 struct BlindResult {
@@ -862,9 +1024,17 @@ static bool bdFrame(const uint8_t* iq, size_t nPairs, long k, int n,
                     std::complex<float>* r, double& dfHz)
 {
     long s0 = k - 20;
-    if (s0 < 0 || (size_t)(s0 + BD_WIN) > nPairs) return false;
-    for (int j = 0; j < BD_WIN; ++j)
-        r[j] = { iq[2 * (s0 + j)] - 127.5f, iq[2 * (s0 + j) + 1] - 127.5f };
+    if (k < 0 || (size_t)(k + BD_WIN - 20) > nPairs) return false;
+    const int prefix = std::max<long>(0, -s0);
+    std::fill(r, r + BD_WIN, std::complex<float>(0.0f, 0.0f));
+    const size_t source = (size_t)std::max<long>(0, s0);
+    for (int j = prefix; j < BD_WIN; ++j) {
+        const size_t sample = source + (size_t)(j - prefix);
+        r[j] = {
+            iq[2 * sample] - 127.5f,
+            iq[2 * sample + 1] - 127.5f
+        };
+    }
     int end = 20 + (n == 56 ? 49 : 84);
     std::complex<double> acc = 0;
     for (int j = 29; j < end; ++j) {
@@ -913,7 +1083,8 @@ bool blindDecodeDpsk(const DpskChannel& ch, const uint8_t* iq, size_t nPairs,
     if (bestS < 0) return false;
 
     bool have = false;
-    for (int cc = bestC - 1; cc <= bestC + 1; ++cc) {
+    for (int cc = bestC - G.p6_timing_radius;
+         cc <= bestC + G.p6_timing_radius; ++cc) {
         if (!bdPreFit(ch, r, cc, num, den, sigE)) continue;
         float phi = (float)std::arg(num), A = (float)(std::abs(num) / den);
         ViterbiResult v = viterbiDpsk(ch, r, BD_WIN, cc, phi, A, n);
@@ -923,66 +1094,48 @@ bool blindDecodeDpsk(const DpskChannel& ch, const uint8_t* iq, size_t nPairs,
             have = true;
         }
     }
-    return have;
-}
-
-static std::string bitsHex(const std::vector<uint8_t>& b)
-{
-    std::string s;
-    for (size_t i = 0; i + 3 < b.size(); i += 4)
-        s += "0123456789ABCDEF"[(b[i] << 3) | (b[i + 1] << 2) | (b[i + 2] << 1) | b[i + 3]];
-    return s;
-}
-
-// Vergleich: Frames aus p6sim-Log (Zeit_µs n HEX Metrik) mit C++ dekodieren
-int viterbiCompare(const char* rawFile, const char* logFile, const DpskChannel& ch)
-{
-    std::ifstream fr(rawFile, std::ios::binary);
-    std::vector<uint8_t> iq((std::istreambuf_iterator<char>(fr)), std::istreambuf_iterator<char>());
-    size_t nPairs = iq.size() / 2;
-    std::ifstream fl(logFile);
-    std::string line;
-    int total = 0, same = 0, shown = 0;
-    long bitErr = 0, bitTot = 0;
-    while (std::getline(fl, line)) {
-        std::istringstream ss(line);
-        double ts, mPy; int n; std::string hx;
-        if (!(ss >> ts >> n >> hx >> mPy)) continue;
-        long k = std::lround(ts * 2.5);
-        BlindResult br;
-        if (!blindDecodeDpsk(ch, iq.data(), nPairs, k, n, br)) continue;
-        std::string hc = bitsHex(br.v.bits);
-        ++total;
-        int e = 0;
-        for (size_t i = 0; i < hx.size() && i < hc.size(); ++i) {
-            int d = std::stoi(hx.substr(i, 1), nullptr, 16) ^ std::stoi(hc.substr(i, 1), nullptr, 16);
-            e += __builtin_popcount(d);
+    if (have) {
+        const double residual_w = out.v.residual_w;
+        const double initial_metric = out.v.metric;
+        const double initial_df_hz = out.dfHz;
+        if (std::abs(residual_w) > 1e-9
+            && out.v.residual_coherence >= 0.05) {
+            for (int j = 0; j < BD_WIN; ++j) {
+                r[j] *= std::complex<float>(
+                    std::polar(1.0, -residual_w * j)
+                );
+            }
+            if (bdPreFit(ch, r, out.c, num, den, sigE)) {
+                float phi = (float)std::arg(num);
+                float A = (float)(std::abs(num) / den);
+                ViterbiResult refined = viterbiDpsk(
+                    ch, r, BD_WIN, out.c, phi, A, n
+                );
+                if (refined.metric < initial_metric) {
+                    out.v = refined;
+                    out.phi = phi;
+                    out.A = A;
+                    out.rho = std::norm(num) / (den * sigE);
+                    out.dfHz = initial_df_hz
+                        + residual_w * 2.5e6 / (2.0 * M_PI);
+                }
+            }
         }
-        bitErr += e; bitTot += n;
-        if (e == 0) ++same;
-        else if (shown++ < 5)
-            printf("  Diff %.1f us: py %s (%.4f)  c++ %s (%.4f)  df %.0f Hz\n",
-                   ts, hx.c_str(), mPy, hc.c_str(), br.v.metric, br.dfHz);
     }
-    printf("Vergleich: %d Frames, identisch %d (%.2f %%), Bitabweichung %.4f %%\n",
-           total, same, total ? 100.0 * same / total : 0.0,
-           bitTot ? 100.0 * bitErr / bitTot : 0.0);
-    return 0;
+    return have;
 }
 // =================== Ende Blind-Decode ===================
 
 // ===================== Paket 4: Adresse, Q, Bestaetigung =====================
-#include <unordered_map>
-
-// CRC-24 Mode S ueber die ersten n-24 Bits (Bits als 0/1)
-static uint32_t crc24Bits(const uint8_t* b, int nData)
-{
-    uint32_t reg = 0;
-    for (int i = 0; i < nData + 24; ++i) {
-        reg = (reg << 1) | (i < nData ? b[i] : 0);
-        if (reg & (1u << 24)) reg ^= 0x1FFF409;
+static uint32_t modesCrc(const uint8_t *b, int nbits_data) {
+    uint32_t crc = 0;
+    for (int k = 0; k < nbits_data; k++) {
+        uint32_t bit = (b[k / 8] >> (7 - k % 8)) & 1;
+        uint32_t top = (crc >> 23) & 1;
+        crc = (crc << 1) & 0xFFFFFF;
+        if (top ^ bit) crc ^= 0xFFF409;
     }
-    return reg & 0xFFFFFF;
+    return crc;
 }
 
 // Uplink-Adresscodierung umkehren: c = obere 24 Koeffizienten von A(x)*G(x)
@@ -1010,12 +1163,12 @@ static bool uplinkAddrSelftest()
 }
 
 // Zieladresse aus AP (UF0, UF16 ...): AP XOR CRC(Daten)
-static uint32_t apToAddress(const std::vector<uint8_t>& b)
+static uint32_t apToAddress(const uint8_t *b, int nbits)
 {
-    int n = (int)b.size();
     uint32_t ap = 0;
-    for (int i = n - 24; i < n; ++i) ap = (ap << 1) | b[i];
-    return uplinkDecodeAddr(crc24Bits(b.data(), n - 24) ^ ap);
+    for (int k = nbits - 24; k < nbits; ++k)
+        ap = (ap << 1) | ((b[k / 8] >> (7 - k % 8)) & 1);
+    return uplinkDecodeAddr(modesCrc(b, nbits - 24) ^ ap);
 }
 
 // Q aus Viterbi-Metrik: 0,0 -> 255, 0,085 -> ~168, >= 0,25 -> 0
@@ -1040,42 +1193,6 @@ struct AddrTracker {
 };
 static AddrTracker g_addrTrack;
 // =================== Ende Paket 4 ===================
-
-
-
-static bool demodBits(int i, const SprLock &L, double w, int nbits,
-                      UplinkResult &R) {
-    const Timing &T = G.tm;
-    double sum_margin = 0.0, min_margin = 1.0;
-    int weak = 0;
-    memset(R.bytes, 0, sizeof(R.bytes));
-
-    for (int b = 0; b < nbits; b++) {
-        double tb = L.t_us + 0.5 + b * us::CHIP;
-        double ta = i + T.f(tb - 0.125);
-        double tc = i + T.f(tb + 0.125);
-        double c;
-        if (!diffCos(ta, tc, w, c)) return false;
-        if (c < 0.0) R.bytes[b / 8] |= (uint8_t)(0x80 >> (b % 8));
-        double mgn = std::fabs(c);
-        sum_margin += mgn;
-        min_margin  = std::min(min_margin, mgn);
-        if (mgn < WEAK_MARGIN) weak++;
-        R.margin[b] = (float)mgn;
-    }
-    R.nbits       = nbits;
-    R.mean_margin = sum_margin / nbits;
-    R.min_margin  = min_margin;
-    R.weak_bits   = weak;
-    return true;
-}
-
-static uint8_t combineQuality(const UplinkResult &R) {
-    double frac_ok = 1.0 - (double)R.weak_bits / std::max(1, R.nbits);
-    double q = R.spr_score * R.mean_margin * frac_ok;
-    q = std::max(0.0, std::min(1.0, q));
-    return (uint8_t)lround(q * 255.0);
-}
 
 static uint32_t bits(const uint8_t *b, int first, int last);
 static int ufLength(uint32_t uf);
@@ -1112,55 +1229,13 @@ static inline bool hasAircraftAddress(uint32_t uf, int nbits) {
 }
 
 static uint32_t apToAddressBytes(const uint8_t* bytes, int nbits) {
-    std::vector<uint8_t> b((size_t)nbits);
-    for (int k = 0; k < nbits; ++k)
-        b[k] = (bytes[k / 8] >> (7 - k % 8)) & 1;
-    return apToAddress(b);
+    return apToAddress(bytes, nbits);
 }
 
 static inline uint32_t ufOf(const uint8_t *b) {
     uint32_t uf = bits(b, 1, 5);
     return ((uf >> 3) == 3) ? 24 : uf;
 }
-
-static bool estimateFineFreq(int i, const SprLock &L, const UplinkResult &R,
-                             double &w_out) {
-    const Timing &T = G.tm;
-    cd acc = 0.0;
-    int n = 0;
-    for (int b = 0; b < R.nbits; b++) {
-        double tb = L.t_us + 0.5 + b * us::CHIP;
-        cd za, zb;
-        if (!getIQSample(i + T.f(tb - 0.125), za) ||
-            !getIQSample(i + T.f(tb + 0.125), zb)) break;
-        cd d = zb * std::conj(za);
-        if ((R.bytes[b / 8] >> (7 - b % 8)) & 1) d = -d;
-        acc += d;
-        n++;
-    }
-    if (n < 32 || std::abs(acc) < 1e-9) return false;
-    double w  = std::arg(acc) / T.f(us::CHIP);
-    double hz = w * G.samplerate / (2.0 * PI);
-    if (std::fabs(hz) > 150e3) return false;
-    w_out = w;
-    return true;
-}
-
-static double   g_pos_m[112] = {0};  static uint32_t g_pos_n[112] = {0};
-static double   g_pat_m[4]   = {0};  static uint32_t g_pat_n[4]   = {0};
-
-static inline int bitAt(const uint8_t *b, int k) { return (b[k / 8] >> (7 - k % 8)) & 1; }
-
-static void collectStats(const UplinkResult &R) {
-    for (int b = 0; b < R.nbits; b++) {
-        g_pos_m[b] += R.margin[b]; g_pos_n[b]++;
-        int prev = (b > 0) ? bitAt(R.bytes, b - 1) : 0;
-        int p = (prev << 1) | bitAt(R.bytes, b);
-        g_pat_m[p] += R.margin[b]; g_pat_n[p]++;
-    }
-}
-
-static double g_spr_offset_us = 0.0;
 
 static double medianMagnitude(int i, double t0_us, double t1_us) {
     const Timing &T = G.tm;
@@ -1227,6 +1302,17 @@ static bool validUplinkFormat(const uint8_t *b, int nbits) {
     return true;
 }
 
+static bool blindDecodeNeeds112(const BlindResult& br) {
+    uint8_t bytes[7] = {0};
+    for (size_t b = 0; b < br.v.bits.size() && b < 56; ++b) {
+        if (br.v.bits[b]) {
+            bytes[b / 8] |= (uint8_t)(0x80 >> (b % 8));
+        }
+    }
+    if (isMode5Format(bytes, 56)) return false;
+    return ufLength(ufOf(bytes)) == 112;
+}
+
 static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
     UplinkResult R;
     R.nbits = nbits;
@@ -1234,173 +1320,175 @@ static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
         R.reject_reason = "length";
         return R;
     }
+
     evalP6Envelope(i, p1_ref, nbits, R.p6_cov, R.p6_min_ratio, R.p6_snr_db,
                    R.pre_snr_db, R.p6_p1_ratio);
-    if (R.p6_cov < 0.65) {
+    if (R.p6_cov < G.p6_min_coverage) {
         R.reject_reason = "p6_coverage";
         return R;
     }
-    if (R.p6_snr_db < MIN_P6_SNR_DB) {
-        R.reject_reason = "p6_snr";
-        return R;
-    }
-    if (R.pre_snr_db < MIN_PREAMBLE_SNR_DB) {
-        R.reject_reason = "preamble_snr";
-        return R;
-    }
-    if (R.p6_p1_ratio > MAX_P6_TO_P1_RATIO) {
+    if (R.p6_p1_ratio > G.p6_max_p1_ratio) {
         R.reject_reason = "p6_p1_ratio";
         return R;
     }
 
-    // --- Viterbi-Pfad (Paket 4) ---
-    if (g_haveChan) {
-        BlindResult br;
-        size_t nPairs = G.iq_hist.size() / 2;
-        if (blindDecodeDpsk(g_chan, G.iq_hist.data(), nPairs, i, nbits, br)) {
-            double w_rad = br.dfHz * (2.0 * PI) / G.samplerate;
-            SprLock L = lockSpr(i, w_rad);
-            L.t_us += g_spr_offset_us;
-
-            R.nbits       = nbits;
-            R.spr_us      = L.t_us;
-            R.spr_score   = L.score;
-            R.freq_off_hz = br.dfHz;
-            R.quality     = (uint8_t)dpskQuality(br.v.metric);
-            R.pre_rho     = br.rho;
-
-            memset(R.bytes, 0, sizeof(R.bytes));
-            for (int b = 0; b < nbits; ++b) {
-                if (br.v.bits[b]) R.bytes[b / 8] |= (uint8_t)(0x80 >> (b % 8));
-            }
-
-            if (R.pre_rho < 0.50) {
-                R.reject_reason = "preamble_rho";
-                return R;
-            }
-            if (R.spr_score < 0.50) {
-                R.reject_reason = "spr_lock";
-                return R;
-            }
-            if (R.quality < MIN_VITERBI_QUALITY) {
-                R.reject_reason = "viterbi_quality";
-                return R;
-            }
-
-            if (!validUplinkFormat(R.bytes, R.nbits)) {
-                R.reject_reason = "uplink_format";
-                return R;
-            }
-            R.mean_margin = (double)R.quality / 255.0;
-            R.min_margin = R.mean_margin;
-            R.weak_bits   = 0;
-            R.viterbi     = true;
-            collectStats(R);
-            R.valid       = true;
-            R.reject_reason = nullptr;
-            G.uplink_ok++;
-        } else {
-            R.reject_reason = "blind_decode";
-        }
+    BlindResult blind;
+    const size_t nPairs = g_valid_samples;
+    bool blind_ready = blindDecodeDpsk(
+        g_chan, G.iq_hist.data(), nPairs, i, nbits, blind
+    );
+    if (blind_ready && nbits == 56 && blindDecodeNeeds112(blind)) {
+        nbits = 112;
+        blind_ready = blindDecodeDpsk(
+            g_chan, G.iq_hist.data(), nPairs, i, nbits, blind
+        );
+    }
+    R.nbits = nbits;
+    evalP6Envelope(i, p1_ref, nbits, R.p6_cov, R.p6_min_ratio, R.p6_snr_db,
+                   R.pre_snr_db, R.p6_p1_ratio);
+    if (R.p6_cov < G.p6_min_coverage) {
+        R.reject_reason = "p6_coverage";
+        return R;
+    }
+    if (R.p6_snr_db < G.p6_min_snr_db) {
+        R.reject_reason = "p6_snr";
+        return R;
+    }
+    if (R.pre_snr_db < G.p6_min_pre_snr_db) {
+        R.reject_reason = "preamble_snr";
+        return R;
+    }
+    if (R.p6_p1_ratio > G.p6_max_p1_ratio) {
+        R.reject_reason = "p6_p1_ratio";
         return R;
     }
 
-    FreqEst fe = estimateFreqOffset(i);
-    SprLock L  = lockSpr(i, fe.w);
-    L.t_us += g_spr_offset_us;
-    R.spr_us      = L.t_us;
-    R.spr_score   = L.score;
-    R.freq_off_hz = fe.hz;
-    if (!L.ok || R.spr_score < 0.50) {
+    if (!blind_ready) {
+        R.reject_reason = "blind_decode";
+        return R;
+    }
+
+    const BlindResult& br = blind;
+    double w_rad = br.dfHz * (2.0 * PI) / G.samplerate;
+    SprLock L = lockSpr(i, w_rad);
+
+    R.spr_us        = L.t_us;
+    R.spr_score     = L.score;
+    R.freq_off_hz   = br.dfHz;
+    R.quality       = (uint8_t)dpskQuality(br.v.metric);
+    R.pre_rho       = br.rho;
+    R.decoder_metric = br.v.metric;
+
+    memset(R.bytes, 0, sizeof(R.bytes));
+    for (int b = 0; b < nbits; ++b) {
+        if (br.v.bits[b]) R.bytes[b / 8] |= (uint8_t)(0x80 >> (b % 8));
+    }
+    R.path_metric_gap = br.v.path_metric_gap;
+    double sum_margin = 0.0;
+    R.min_margin = 1.0;
+    for (int b = 0; b < R.nbits; ++b) {
+        double margin = br.v.margin[b];
+        R.margin[b] = (float)margin;
+        sum_margin += margin;
+        R.min_margin = std::min(R.min_margin, margin);
+    }
+    R.mean_margin = sum_margin / R.nbits;
+    R.viterbi = true;
+
+    if (R.pre_rho < G.p6_min_rho) {
+        R.reject_reason = "preamble_rho";
+        return R;
+    }
+    if (R.spr_score < G.p6_min_lock) {
         R.reject_reason = "spr_lock";
         return R;
     }
-    if (!demodBits(i, L, fe.w, nbits, R)) {
-        R.reject_reason = "demodulation";
-        return R;
-    }
-
-    if (ufLength(ufOf(R.bytes)) == 112 && R.nbits == 56) {
-        UplinkResult R2 = R;
-        if (demodBits(i, L, fe.w, 112, R2)) {
-            R = R2;
-            evalP6Envelope(i, p1_ref, 112, R.p6_cov, R.p6_min_ratio, R.p6_snr_db,
-                           R.pre_snr_db, R.p6_p1_ratio);
-            if (R.p6_cov < 0.65) {
-                R.reject_reason = "p6_coverage";
-                return R;
-            }
-            if (R.p6_snr_db < MIN_P6_SNR_DB) {
-                R.reject_reason = "p6_snr";
-                return R;
-            }
-            if (R.pre_snr_db < MIN_PREAMBLE_SNR_DB) {
-                R.reject_reason = "preamble_snr";
-                return R;
-            }
-            if (R.p6_p1_ratio > MAX_P6_TO_P1_RATIO) {
-                R.reject_reason = "p6_p1_ratio";
-                return R;
-            }
-        }
-    }
-
-    if (ufLength(ufOf(R.bytes)) == 0 && L.t_us > us::SPR_PRIOR + 0.25) {
-        SprLock L2 = L;
-        L2.t_us -= 0.5;
-        UplinkResult R2 = R;
-        if (demodBits(i, L2, fe.w, nbits, R2) && ufLength(ufOf(R2.bytes)) != 0) {
-            L = L2; R = R2; R.spr_us = L.t_us;
-        }
-    }
-
-    double wf;
-    if (estimateFineFreq(i, L, R, wf)) {
-        double hz_f = wf * G.samplerate / (2.0 * PI);
-        R.freq_off_hz = hz_f;
-        if (std::fabs(hz_f - fe.hz) > 5e3) {
-            UplinkResult R2 = R;
-            if (demodBits(i, L, wf, R.nbits, R2) && R2.mean_margin > R.mean_margin) {
-                R = R2;
-                R.freq_off_hz = hz_f;
-            }
-        }
-    }
-
-    R.quality = combineQuality(R);
-    if (R.quality < 80) {
-        R.reject_reason = "legacy_quality";
+    if (R.quality < G.p6_min_quality) {
+        R.reject_reason = "viterbi_quality";
         return R;
     }
     if (!validUplinkFormat(R.bytes, R.nbits)) {
         R.reject_reason = "uplink_format";
         return R;
     }
-    collectStats(R);
     R.valid = true;
-    R.reject_reason = nullptr;
-    if (R.weak_bits * 4 > R.nbits) G.uplink_weak++;
-    else                           G.uplink_ok++;
+    G.uplink_ok++;
     return R;
 }
 
 // ---------- Mode-S-CRC & UF-Dekodierung ----------
-static uint32_t modesCrc(const uint8_t *b, int nbits_data) {
-    uint32_t crc = 0;
-    for (int k = 0; k < nbits_data; k++) {
-        uint32_t bit = (b[k / 8] >> (7 - k % 8)) & 1;
-        uint32_t top = (crc >> 23) & 1;
-        crc = (crc << 1) & 0xFFFFFF;
-        if (top ^ bit) crc ^= 0xFFF409;
-    }
-    return crc;
-}
-
 static inline uint32_t bits(const uint8_t *b, int first, int last) {
     uint32_t v = 0;
     for (int k = first; k <= last; k++)
         v = (v << 1) | ((b[(k - 1) / 8] >> (7 - (k - 1) % 8)) & 1);
     return v;
+}
+
+static int formatP6ProtocolJson(const UplinkResult& R, char *out, size_t size) {
+    const uint8_t *b = R.bytes;
+    uint32_t uf = ufOf(b);
+    int n = 0;
+
+    switch (uf) {
+    case 0:
+    case 16:
+        n = snprintf(out, size,
+                     ",\"rl\":%u,\"aq\":%u",
+                     bits(b, 9, 9), bits(b, 14, 14));
+        if (uf == 0) {
+            n += snprintf(out + std::min<size_t>(n, size - 1),
+                          size - std::min<size_t>(n, size - 1),
+                          ",\"ds\":%u", bits(b, 15, 22));
+        } else if (R.nbits == 112) {
+            n += snprintf(out + std::min<size_t>(n, size - 1),
+                          size - std::min<size_t>(n, size - 1),
+                          ",\"mid\":\"%06X\"", bits(b, 65, 88));
+        }
+        break;
+    case 4:
+    case 5:
+    case 20:
+    case 21: {
+        uint32_t di = bits(b, 14, 16);
+        n = snprintf(out, size,
+                     ",\"pc\":%u,\"rr\":%u,\"di\":%u,\"sd\":%u",
+                     bits(b, 6, 8), bits(b, 9, 13), di, bits(b, 17, 32));
+        if (di == 0 || di == 1 || di == 7) {
+            n += snprintf(out + std::min<size_t>(n, size - 1),
+                          size - std::min<size_t>(n, size - 1),
+                          ",\"ii\":%u", bits(b, 17, 20));
+        } else if (di == 3) {
+            n += snprintf(out + std::min<size_t>(n, size - 1),
+                          size - std::min<size_t>(n, size - 1),
+                          ",\"si\":%u", bits(b, 17, 22));
+        }
+        break;
+    }
+    case 11: {
+        uint32_t pr = bits(b, 6, 9);
+        uint32_t ic = bits(b, 10, 13);
+        uint32_t cl = bits(b, 14, 16);
+        n = snprintf(out, size, ",\"pr\":%u,\"ic\":%u,\"cl\":%u", pr, ic, cl);
+        if (cl == 0) {
+            n += snprintf(out + std::min<size_t>(n, size - 1),
+                          size - std::min<size_t>(n, size - 1),
+                          ",\"ii\":%u", ic);
+        } else if (cl <= 4) {
+            n += snprintf(out + std::min<size_t>(n, size - 1),
+                          size - std::min<size_t>(n, size - 1),
+                          ",\"si\":%u", ic + 16 * (cl - 1));
+        }
+        break;
+    }
+    case 24:
+        n = snprintf(out, size, ",\"rc\":%u,\"nc\":%u",
+                     bits(b, 3, 4), bits(b, 5, 8));
+        break;
+    default:
+        out[0] = '\0';
+        break;
+    }
+    return n;
 }
 
 static int ufLength(uint32_t uf) {
@@ -1492,10 +1580,10 @@ static void analyzeBurst(uint64_t pos, MsgCode code, const uint8_t *m,
 
     if (R && R->valid) {
         fprintf(G_txt, "\n  [P6] %d Bit spr=%.2f us lock=%.2f "
-                       "margin=%.2f/%.2f weak=%d df=%+.1f kHz Q=%u "
+                       "margin=%.2f/%.2f df=%+.1f kHz Q=%u "
                        "cov=%.2f p6min=%.2f p6snr=%.1f dB rho=%.2f HEX=",
                 R->nbits, R->spr_us, R->spr_score, R->mean_margin,
-                R->min_margin, R->weak_bits, R->freq_off_hz / 1e3, R->quality,
+                R->min_margin, R->freq_off_hz / 1e3, R->quality,
                 R->p6_cov, R->p6_min_ratio, R->p6_snr_db, R->pre_rho);
         for (int k = 0; k < R->nbits / 8; k++) fprintf(G_txt, "%02X", R->bytes[k]);
         printUfFields(*R, pos);
@@ -1545,53 +1633,38 @@ static bool handleModeS(const uint8_t *m, uint32_t i, int r1,
         }
         R = decodeUplink((int)i, r1, nbits);
     }
-    skip = (nbits == 112) ? T.skip_s112
-         : (nbits == 56)  ? T.skip_s56
+    const int decoded_nbits =
+        (G.uplink_decode && R.nbits > 0) ? R.nbits : nbits;
+    skip = (decoded_nbits == 112) ? T.skip_s112
+         : (decoded_nbits == 56)  ? T.skip_s56
          :                  T.min_skip_s;
     return true;
 }
 
-struct PendingP6 {
-    uint64_t     pos = 0;
-    int          p1 = 0;
-    int          p2 = 0;
-    UplinkResult R;
-    uint8_t      samples[32] = {0};
-    int          show = 0;
-};
-
-struct EmitterContext {
-    std::vector<PendingP6> train;
-    uint64_t               last_pos = 0;
-};
-static EmitterContext g_emitCtx;
-
-static void flushEmitterTrain() {
-    if (g_emitCtx.train.empty()) return;
-
-    for (auto &ev : g_emitCtx.train) {
-        uint32_t uf = ufOf(ev.R.bytes);
-        ev.R.mode5 = isMode5Format(ev.R.bytes, ev.R.nbits);
-        if (ev.R.mode5) {
-            ev.R.has_addr = false;
-            ev.R.addr     = 0;
-            ev.R.addrCnt  = 0;
-        } else {
-            ev.R.has_addr = hasAircraftAddress(uf, ev.R.nbits);
-            if (ev.R.has_addr) {
-                ev.R.addr    = apToAddressBytes(ev.R.bytes, ev.R.nbits);
-                ev.R.addrCnt = g_addrTrack.seen(ev.R.addr, ev.pos / (double)G.samplerate);
-            }
-        }
-
-        writeJsonlP6(ev.pos, ev.p1, ev.p2, ev.R);
-        if (G.print_detected) {
-            analyzeBurst(ev.pos, MSG_S, ev.samples, &ev.R);
-            printSamples(ev.samples, ev.show);
-            fputc('\n', G_txt);
+static void emitP6(uint64_t pos, int p1, int p2, UplinkResult &R,
+                   const uint8_t *samples, int show) {
+    const uint32_t uf = ufOf(R.bytes);
+    R.mode5 = isMode5Format(R.bytes, R.nbits);
+    if (R.mode5) {
+        R.has_addr = false;
+        R.addr = 0;
+        R.addrCnt = 0;
+    } else {
+        R.has_addr = hasAircraftAddress(uf, R.nbits);
+        if (R.has_addr) {
+            R.addr = apToAddressBytes(R.bytes, R.nbits);
+            R.addrCnt = g_addrTrack.seen(
+                R.addr, pos / (double)G.samplerate
+            );
         }
     }
-    g_emitCtx.train.clear();
+
+    writeJsonlP6(pos, p1, p2, R);
+    if (G.print_detected) {
+        analyzeBurst(pos, MSG_S, samples, &R);
+        printSamples(samples, show);
+        fputc('\n', G_txt);
+    }
 }
 
 static uint32_t detectBlock(uint32_t total, bool final) {
@@ -1618,7 +1691,8 @@ static uint32_t detectBlock(uint32_t total, bool final) {
         bool haveR = false;
 
         // --- Mode S ---
-        if (checkModeS(m) && handleModeS(m, i, r1, skip, R)) {
+        const bool mode_s_preamble = checkModeS(m);
+        if (mode_s_preamble && handleModeS(m, i, r1, skip, R)) {
             code  = MSG_S;
             haveR = G.uplink_decode;
             show  = T.p2 + T.pw + 2;
@@ -1630,8 +1704,9 @@ static uint32_t detectBlock(uint32_t total, bool final) {
         }
         // --- Mode A / C ---
         else {
-            int off = checkP3(m, T.p3_a) ? T.p3_a
-                    : checkP3(m, T.p3_c) ? T.p3_c : 0;
+            const bool p3a = checkP3(m, T.p3_a);
+            const bool p3c = checkP3(m, T.p3_c);
+            int off = p3a ? T.p3_a : p3c ? T.p3_c : 0;
             if (off) {
                 const bool isA = (off == T.p3_a);
                 const int  os  = off + T.p4_gap;
@@ -1670,20 +1745,7 @@ if (code != MSG_NONE) {
                 p2 = std::max<int>(p2, m[T.p2 + k]);
             }
             if (code == MSG_S && haveR && R.valid) {
-                const uint64_t dwell_gap = (uint64_t)llround(0.055 * G.samplerate);
-                if (!g_emitCtx.train.empty() && pos > g_emitCtx.last_pos &&
-                    (pos - g_emitCtx.last_pos) > dwell_gap) {
-                    flushEmitterTrain();
-                }
-                PendingP6 ev;
-                ev.pos  = pos;
-                ev.p1   = p1;
-                ev.p2   = p2;
-                ev.R    = R;
-                ev.show = std::min(show, 32);
-                memcpy(ev.samples, m, (size_t)ev.show);
-                g_emitCtx.train.push_back(ev);
-                g_emitCtx.last_pos = pos;
+                emitP6(pos, p1, p2, R, m, std::min(show, 32));
             } else {
                 if (code == MSG_S && haveR)
                     writeJsonlP6Reject(pos, p1, p2, R);
@@ -1712,13 +1774,6 @@ if (code != MSG_NONE) {
             }
         }
         i += (uint32_t)std::max(1, skip);
-    }
-
-    const uint64_t dwell_gap = (uint64_t)llround(0.055 * G.samplerate);
-    uint64_t block_end = G.sample_base + limit;
-    if (final || (!g_emitCtx.train.empty() && block_end > g_emitCtx.last_pos &&
-                  (block_end - g_emitCtx.last_pos) > dwell_gap)) {
-        flushEmitterTrain();
     }
 
     return std::min(i, total);
@@ -1948,6 +2003,15 @@ static void showHelp() {
 "  --out-dir <pfad>        Ausgabeverzeichnis fuer JSONL/cu8 Dateien\n"
 "  --save-iq               IQ-Daten (im cu8 Format) speichern\n"
 "  --p6-diagnostics        Abgelehnte P6-Kandidaten als JSONL ausgeben\n"
+"  --p6-quality <0..255>   Minimale Viterbi-Qualitaet (Default 180)\n"
+"  --p6-coverage <0..1>    Minimale P6-Huellkurvenabdeckung (Default 0.65)\n"
+"  --p6-snr <dB>           Minimales P6-SNR (Default 6)\n"
+"  --p6-pre-snr <dB>       Minimales Praeambel-SNR (Default 3)\n"
+"  --p6-p1-ratio <r>       Maximales P6/P1-Verhaeltnis (Default 4)\n"
+"  --p6-rho <0..1>         Minimale Praeambelkorrelation (Default 0.50)\n"
+"  --p6-lock <0..1>        Minimale SPR-Lock-Qualitaet (Default 0.50)\n"
+"  --p6-timing-radius <n>  Viterbi-Feintiming um Besttreffer (0..8, Default 1)\n"
+"  --chan <pfad>           DPSK-Kanaldatei fuer den Uplink-Decoder\n"
 "  --msgs                  Erkannte Abfragen mit Samples ausgeben\n"
 "  --order                 Reihenfolge der Abfragen ausgeben\n"
 "  --blmode                Baseline-Werte fuer mpa/mnf/mnfc ausgeben\n"
@@ -1990,20 +2054,15 @@ static float parseFloat(const char *opt, const char *s, float lo, float hi) {
 
 static void parseArgs(int argc, char **argv) {
     Thresholds &t = G.th;
-        const char* vcompareLog = nullptr;
-for (int i = 1; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "--device")) {
             G.dev_index = (int)parseLong(a, needArg(argc, argv, i), 0, 255);
         } else if (!strcmp(a, "--file")) {
             G.filename = needArg(argc, argv, i);
         } else if (!strcmp(a, "--chan")) {
-	    if (g_haveChan) uplinkAddrSelftest();
             g_haveChan = loadDpskChannel(needArg(argc, argv, i), g_chan);
-        } else if (!strcmp(a, "--vcompare")) {
-            vcompareLog = needArg(argc, argv, i);
-        } else if (!strcmp(a, "--spr-offset")) {
-            g_spr_offset_us = strtod(needArg(argc, argv, i), nullptr);
+            if (g_haveChan) uplinkAddrSelftest();
         } else if (!strcmp(a, "--gain")) {
             const char *v = needArg(argc, argv, i);
             if (!strcmp(v, "auto"))     G.gain = AUTO_GAIN;
@@ -2066,6 +2125,23 @@ for (int i = 1; i < argc; i++) {
             G.save_iq = true;
         } else if (!strcmp(a, "--p6-diagnostics")) {
             G.p6_diagnostics = true;
+        } else if (!strcmp(a, "--p6-quality")) {
+            G.p6_min_quality = (int)parseLong(a, needArg(argc, argv, i), 0, 255);
+        } else if (!strcmp(a, "--p6-coverage")) {
+            G.p6_min_coverage = parseFloat(a, needArg(argc, argv, i), 0.0f, 1.0f);
+        } else if (!strcmp(a, "--p6-snr")) {
+            G.p6_min_snr_db = parseFloat(a, needArg(argc, argv, i), -60.0f, 120.0f);
+        } else if (!strcmp(a, "--p6-pre-snr")) {
+            G.p6_min_pre_snr_db = parseFloat(a, needArg(argc, argv, i), -60.0f, 120.0f);
+        } else if (!strcmp(a, "--p6-p1-ratio")) {
+            G.p6_max_p1_ratio = parseFloat(a, needArg(argc, argv, i), 0.0f, 20.0f);
+        } else if (!strcmp(a, "--p6-rho")) {
+            G.p6_min_rho = parseFloat(a, needArg(argc, argv, i), 0.0f, 1.0f);
+        } else if (!strcmp(a, "--p6-lock")) {
+            G.p6_min_lock = parseFloat(a, needArg(argc, argv, i), 0.0f, 1.0f);
+        } else if (!strcmp(a, "--p6-timing-radius")) {
+            G.p6_timing_radius =
+                (int)parseLong(a, needArg(argc, argv, i), 0, 8);
         } else if (!strcmp(a, "--help")) {
             showHelp();
             exit(0);
@@ -2081,10 +2157,8 @@ for (int i = 1; i < argc; i++) {
                 G.samplerate);
         std::exit(1);
     }
-    if (vcompareLog) {
-        if (!g_haveChan || !G.filename) { fprintf(stderr, "--vcompare braucht --file und --chan\n"); std::exit(1); }
-        std::exit(viterbiCompare(G.filename, vcompareLog, g_chan));
-    }
+    if (G.uplink_decode && !g_haveChan)
+        die("--uplink-decode benoetigt --chan");
     if (G.p6_diagnostics && G.out_dir.empty())
         die("--p6-diagnostics benoetigt --out-dir");
     if (G.p6_diagnostics && !G.uplink_decode)
@@ -2184,18 +2258,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Warnung: %" PRIu64 " Puffer verworfen "
                         "(Verarbeitung zu langsam)\n", G.dropped);
     if (G.uplink_decode) {
-        fprintf(stderr, "Uplink-Decoder: %" PRIu64 " sauber, %" PRIu64
-                        " mit >25%% weak bits\n", G.uplink_ok, G.uplink_weak);
-        fprintf(stderr, "Margin je Bitposition (Frames, 1-basiert):\n");
-        for (int b = 0; b < 112; b++)
-            if (g_pos_n[b])
-                fprintf(stderr, "  Bit %3d: %.3f (n=%u)%s", b + 1,
-                        g_pos_m[b] / g_pos_n[b], g_pos_n[b], (b % 4 == 3) ? "\n" : "");
-        static const char *pn[4] = {"0->0", "0->1", "1->0", "1->1"};
-        fprintf(stderr, "\nMargin nach Muster (Vorgänger->Bit):\n");
-        for (int p = 0; p < 4; p++)
-            if (g_pat_n[p])
-                fprintf(stderr, "  %s: %.3f (n=%u)\n", pn[p], g_pat_m[p] / g_pat_n[p], g_pat_n[p]);
+        fprintf(stderr, "Uplink-Decoder: %" PRIu64 " akzeptiert\n",
+                G.uplink_ok);
     }
 
 
@@ -2208,7 +2272,6 @@ int main(int argc, char **argv) {
     pthread_join(G.reader_thread, nullptr);
 
     if (G.dev) { rtlsdr_close(G.dev); G.dev = nullptr; }
-    flushEmitterTrain();
     closeOutputs();
     return 0;
 }
