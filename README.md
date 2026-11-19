@@ -31,7 +31,7 @@ apt update && apt install -y build-essential pkg-config librtlsdr-dev
 git clone https://github.com/davidkirberich/dump1030.git
 cd dump1030
 make
-chmod +x dump1030 monitor_p6.py radar_signatures.py
+chmod +x dump1030 monitor_p6.py
 ```
 
 ## Quick Start
@@ -159,18 +159,6 @@ python3 monitor_p6.py 'captured/events_*.jsonl'
 ```
 
 Keys: `1` repeated aircraft, `2` II/SI interrogators, `j`/`k` or arrows to navigate, `/` to filter, `c` to clear filter, `Space`/`p` to pause, `:w [path]` to export TSV, `:q` to quit.
-
-### `radar_signatures.py` (Rotation & Burst Analysis)
-
-Estimates recurring radar rotation periods (4.8..5.2 s) and phases directly from 1030 MHz JSONL logs, with harmonic rejection and optional drift windows for moving emitters.
-
-```bash
-python3 radar_signatures.py 'captured/events_*.jsonl'
-python3 radar_signatures.py 'captured/events_*.jsonl' --channel p6 --json
-python3 radar_signatures.py 'captured/events_*.jsonl' --channel p6 --duration-s 3600 --explore
-```
-
-Channels: `civil` (default: SSR + P6 UF4/5/11/20/21), `mode5`, `acas` (UF0/16), `p6` (all accepted P6). `--explore` outputs inter-event gaps, 55 ms burst shapes, burst families, and DF/P1 drift statistics without assuming a fixed rotation period.
 
 ### `p6sim.py` (Simulator & Channel Estimator)
 
