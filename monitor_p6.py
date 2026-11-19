@@ -22,6 +22,20 @@ class Sighting:
     last_seen: float
 
 
+@dataclass
+class Interrogator:
+    kind: str
+    code: int
+    count: int
+    qmax: int
+    q: int
+    first_seen: float
+    last_seen: float
+    ufs: Set[int]
+    targets: Set[str]
+    payload: str
+
+
 class JsonlFollower:
     def __init__(self, pattern: str) -> None:
         self.pattern = pattern
@@ -60,12 +74,58 @@ def valid_address(address: object) -> bool:
     return value not in (0, 0xFFFFFF)
 
 
-def update_sightings(events: List[dict], sightings: Dict[str, Sighting]) -> int:
+def update_views(
+    events: List[dict],
+    sightings: Dict[str, Sighting],
+    interrogators: Dict[str, Interrogator],
+    uf_counts: Dict[int, int],
+) -> Tuple[int, int, int]:
     confirmed_events = 0
+    p6_events = 0
+    interrogator_events = 0
     now = time.time()
     for event in events:
         if event.get("type") != "P6":
             continue
+        p6_events += 1
+        uf = int(event.get("uf", -1))
+        uf_counts[uf] = uf_counts.get(uf, 0) + 1
+
+        code = event.get("ii")
+        kind = "II"
+        if code is None:
+            code = event.get("si")
+            kind = "SI"
+        if isinstance(code, int):
+            interrogator_events += 1
+            key = f"{kind}{code:02d}"
+            quality = int(event.get("q", 0))
+            current_interrogator = interrogators.get(key)
+            if current_interrogator is None:
+                interrogators[key] = Interrogator(
+                    kind=kind,
+                    code=code,
+                    count=1,
+                    qmax=quality,
+                    q=quality,
+                    first_seen=now,
+                    last_seen=now,
+                    ufs={uf},
+                    targets=set(),
+                    payload=str(event.get("hex", "")),
+                )
+                current_interrogator = interrogators[key]
+            else:
+                current_interrogator.count += 1
+                current_interrogator.q = quality
+                current_interrogator.qmax = max(current_interrogator.qmax, quality)
+                current_interrogator.last_seen = now
+                current_interrogator.ufs.add(uf)
+                current_interrogator.payload = str(event.get("hex", ""))
+            address = event.get("aa")
+            if valid_address(address):
+                current_interrogator.targets.add(address)
+
         address = event.get("aa")
         if not valid_address(address):
             continue
@@ -91,7 +151,7 @@ def update_sightings(events: List[dict], sightings: Dict[str, Sighting]) -> int:
             current.uf = int(event.get("uf", -1))
             current.payload = str(event.get("hex", ""))
             current.last_seen = now
-    return confirmed_events
+    return p6_events, confirmed_events, interrogator_events
 
 
 def age_text(seconds: int) -> str:
@@ -109,6 +169,9 @@ class Monitor:
         self.follower = follower
         self.refresh = refresh
         self.sightings: Dict[str, Sighting] = {}
+        self.interrogators: Dict[str, Interrogator] = {}
+        self.uf_counts: Dict[int, int] = {}
+        self.view = 1
         self.paused = False
         self.running = True
         self.filter_text = ""
@@ -116,6 +179,8 @@ class Monitor:
         self.scroll = 0
         self.message = ""
         self.confirmed_events = 0
+        self.p6_events = 0
+        self.interrogator_events = 0
         self.events_since_rate = 0
         self.rate_started = time.monotonic()
         self.event_rate = 0.0
@@ -130,11 +195,28 @@ class Monitor:
         ]
         return sorted(rows, key=lambda sighting: (-sighting.last_seen, sighting.address))
 
+    def interrogator_rows(self) -> List[Interrogator]:
+        needle = self.filter_text.upper()
+        rows = [
+            interrogator for interrogator in self.interrogators.values()
+            if not needle
+            or needle in f"{interrogator.kind}{interrogator.code:02d}"
+            or any(needle in target for target in interrogator.targets)
+        ]
+        return sorted(
+            rows,
+            key=lambda interrogator: (-interrogator.last_seen, interrogator.kind, interrogator.code),
+        )
+
     def poll(self) -> None:
         events = self.follower.read_new()
-        new_confirmed = update_sightings(events, self.sightings)
+        new_p6, new_confirmed, new_interrogators = update_views(
+            events, self.sightings, self.interrogators, self.uf_counts
+        )
+        self.p6_events += new_p6
         self.confirmed_events += new_confirmed
-        self.events_since_rate += new_confirmed
+        self.interrogator_events += new_interrogators
+        self.events_since_rate += new_p6
 
         elapsed = time.monotonic() - self.rate_started
         if elapsed >= 1.0:
@@ -148,6 +230,87 @@ class Monitor:
             return
         self.screen.addnstr(y, 0, text.ljust(width - 1), width - 1, attr)
 
+    def render_aircraft(self, visible_rows: int, header_attr: int) -> None:
+        rows = self.rows()
+        self.selection = min(self.selection, max(0, len(rows) - 1))
+        if self.selection < self.scroll:
+            self.scroll = self.selection
+        elif self.selection >= self.scroll + visible_rows:
+            self.scroll = max(0, self.selection - visible_rows + 1)
+
+        self.add_line(
+            3,
+            f"{'ICAO':<7}{'SEEN':>6}  {'Q':>3}  {'QMAX':>4}  {'UF':>3}  "
+            f"{'AGE':>7}  PAYLOAD",
+            header_attr,
+        )
+        now = time.time()
+        for index, sighting in enumerate(
+            rows[self.scroll:self.scroll + visible_rows], start=self.scroll
+        ):
+            line = (
+                f"{sighting.address:<7}{sighting.count:>6}  "
+                f"{sighting.q:>3}  {sighting.qmax:>4}  {sighting.uf:>3}  "
+                f"{age_text(max(0, int(now - sighting.last_seen))):>7}  "
+                f"{sighting.payload}"
+            )
+            self.add_line(
+                4 + index - self.scroll,
+                line,
+                curses.A_REVERSE if index == self.selection else 0,
+            )
+        if not rows:
+            if self.p6_events == 0:
+                self.add_line(4, " waiting for P6 events")
+            else:
+                self.add_line(
+                    4, " P6 received; waiting for a repeated ICAO address"
+                )
+        return
+
+    def render_interrogators(self, visible_rows: int, header_attr: int) -> None:
+        rows = self.interrogator_rows()
+        self.selection = min(self.selection, max(0, len(rows) - 1))
+        if self.selection < self.scroll:
+            self.scroll = self.selection
+        elif self.selection >= self.scroll + visible_rows:
+            self.scroll = max(0, self.selection - visible_rows + 1)
+
+        self.add_line(
+            3,
+            f"{'ID':<6}{'SEEN':>7}  {'Q':>3}  {'QMAX':>4}  {'UFs':<11}"
+            f"{'AGE':>7}  TARGETS / LAST PAYLOAD",
+            header_attr,
+        )
+        now = time.time()
+        for index, interrogator in enumerate(
+            rows[self.scroll:self.scroll + visible_rows], start=self.scroll
+        ):
+            ufs = ",".join(str(uf) for uf in sorted(interrogator.ufs))
+            targets = ",".join(sorted(interrogator.targets)) or "-"
+            line = (
+                f"{interrogator.kind}{interrogator.code:02d}  "
+                f"{interrogator.count:>6}  {interrogator.q:>3}  "
+                f"{interrogator.qmax:>4}  {ufs:<11}"
+                f"{age_text(max(0, int(now - interrogator.last_seen))):>7}  "
+                f"{targets} / {interrogator.payload}"
+            )
+            self.add_line(
+                4 + index - self.scroll,
+                line,
+                curses.A_REVERSE if index == self.selection else 0,
+            )
+        if not rows:
+            if self.p6_events == 0:
+                self.add_line(4, " waiting for P6 events")
+            else:
+                self.add_line(4, " no II/SI fields in the accepted P6 traffic")
+                uf_summary = " ".join(
+                    f"UF{uf}:{count}" for uf, count in sorted(self.uf_counts.items())
+                )
+                self.add_line(5, f" observed formats: {uf_summary}")
+        return
+
     def render(self) -> None:
         height, width = self.screen.getmaxyx()
         self.screen.erase()
@@ -159,19 +322,14 @@ class Monitor:
             header_attr = curses.A_REVERSE
 
         visible_rows = max(0, height - 7)
-        rows = self.rows()
-        self.selection = min(self.selection, max(0, len(rows) - 1))
-        if self.selection < self.scroll:
-            self.scroll = self.selection
-        elif self.selection >= self.scroll + visible_rows:
-            self.scroll = max(0, self.selection - visible_rows + 1)
-
         mode = "PAUSED" if self.paused else "LIVE"
         filter_label = self.filter_text or "-"
+        view_name = "Aircrafts" if self.view == 1 else "Interrogators"
         self.add_line(
             0,
-            f" dump1030 top  [{mode}]  addresses {len(self.sightings)}  "
-            f"events {self.confirmed_events} ({self.event_rate:.1f}/s)  "
+            f" dump1030 top  [{mode}]  {view_name}  "
+            f"aircrafts {len(self.sightings)}  interrogators {len(self.interrogators)}  "
+            f"P6 {self.p6_events} ({self.event_rate:.1f}/s)  "
             f"files {len(self.follower.known_files)}",
             title_attr,
         )
@@ -180,32 +338,18 @@ class Monitor:
             f" source: {self.follower.pattern}  |  filter: {filter_label}",
             title_attr,
         )
-        self.add_line(
-            3,
-            f"{'ICAO':<7}{'SEEN':>6}  {'Q':>3}  {'QMAX':>4}  {'UF':>3}  "
-            f"{'AGE':>7}  PAYLOAD",
-            header_attr,
-        )
-
-        now = time.time()
-        shown = rows[self.scroll:self.scroll + visible_rows]
-        for index, sighting in enumerate(shown, start=self.scroll):
-            y = 4 + index - self.scroll
-            line = (
-                f"{sighting.address:<7}{sighting.count:>6}  "
-                f"{sighting.q:>3}  {sighting.qmax:>4}  {sighting.uf:>3}  "
-                f"{age_text(max(0, int(now - sighting.last_seen))):>7}  "
-                f"{sighting.payload}"
-            )
-            attr = curses.A_REVERSE if index == self.selection else 0
-            self.add_line(y, line, attr)
-        if not rows:
-            self.add_line(4, " waiting for confirmed ICAO addresses")
+        if self.view == 1:
+            self.render_aircraft(visible_rows, header_attr)
+            rows = self.rows()
+        else:
+            self.render_interrogators(visible_rows, header_attr)
+            rows = self.interrogator_rows()
 
         footer_y = max(4, height - 3)
         self.add_line(
             footer_y,
-            " q/:q quit  space/p pause  j/k or arrows select  / filter  "
+            " 1 aircrafts  2 interrogators  q/:q quit  space/p pause  "
+            "j/k or arrows select  / filter  "
             "c clear filter  :w [file] export",
             header_attr,
         )
@@ -243,15 +387,31 @@ class Monitor:
         return False, value
 
     def export(self, path: str) -> None:
-        target = path or "p6_sightings.tsv"
+        if self.view == 1:
+            target = path or "p6_sightings.tsv"
+            with open(target, "w", encoding="utf-8") as stream:
+                stream.write("ICAO\tSEEN\tQ\tQMAX\tUF\tPAYLOAD\n")
+                for sighting in self.rows():
+                    stream.write(
+                        f"{sighting.address}\t{sighting.count}\t{sighting.q}\t"
+                        f"{sighting.qmax}\t{sighting.uf}\t{sighting.payload}\n"
+                    )
+            self.message = f"exported {len(self.rows())} addresses to {target}"
+            return
+
+        target = path or "p6_interrogators.tsv"
         with open(target, "w", encoding="utf-8") as stream:
-            stream.write("ICAO\tSEEN\tQ\tQMAX\tUF\tPAYLOAD\n")
-            for sighting in self.rows():
+            stream.write("ID\tSEEN\tQ\tQMAX\tUFs\tTARGETS\tPAYLOAD\n")
+            for interrogator in self.interrogator_rows():
+                ufs = ",".join(str(uf) for uf in sorted(interrogator.ufs))
+                targets = ",".join(sorted(interrogator.targets))
                 stream.write(
-                    f"{sighting.address}\t{sighting.count}\t{sighting.q}\t"
-                    f"{sighting.qmax}\t{sighting.uf}\t{sighting.payload}\n"
+                    f"{interrogator.kind}{interrogator.code:02d}\t"
+                    f"{interrogator.count}\t{interrogator.q}\t"
+                    f"{interrogator.qmax}\t{ufs}\t{targets}\t"
+                    f"{interrogator.payload}\n"
                 )
-        self.message = f"exported {len(self.rows())} addresses to {target}"
+        self.message = f"exported {len(self.interrogator_rows())} interrogators to {target}"
 
     def command(self) -> None:
         accepted, value = self.input_line(":")
@@ -292,11 +452,17 @@ class Monitor:
         elif key == "c":
             self.filter_text = ""
             self.message = ""
+        elif key in ("1", "2"):
+            self.view = int(key)
+            self.selection = self.scroll = 0
+            self.filter_text = ""
+            self.message = ""
         elif key in (" ", "p"):
             self.paused = not self.paused
             self.message = "paused - screen is stable for selection" if self.paused else ""
         elif key in ("j", curses.KEY_DOWN):
-            self.selection = min(self.selection + 1, max(0, len(self.rows()) - 1))
+            length = len(self.rows()) if self.view == 1 else len(self.interrogator_rows())
+            self.selection = min(self.selection + 1, max(0, length - 1))
         elif key in ("k", curses.KEY_UP):
             self.selection = max(0, self.selection - 1)
         elif key == curses.KEY_RESIZE:
