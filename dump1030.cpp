@@ -3,6 +3,7 @@
 //   dump1030.cpp -lrtlsdr -o dump1030
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cinttypes>
@@ -18,6 +19,7 @@
 #include <limits>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
@@ -30,15 +32,16 @@ static constexpr double PI           = 3.14159265358979323846;
 static const uint32_t DEFAULT_FREQ   = 1030000000;
 static const uint32_t DEFAULT_RATE   = 2500000;
 static const uint32_t MIN_RATE       = 2400000;
-static const uint32_t MAX_RATE       = 3200000;
+static const uint32_t MAX_RATE       = 30000000;
 static const uint32_t DEFAULT_LEN    = 262144;   // Bytes (I/Q)
 static const uint32_t MIN_LEN        = 16384;
 static const int      AUTO_GAIN      = -100;
 static const int      MAX_GAIN       = 999999;
-// Gemeinsamer Overlap fuer Magnitude UND I/Q (Samples).
-// Laengster Zugriff: Mode S 112 Bit endet 33,75 us nach P1
-// -> 108 Samples bei 3,2 MS/s + Stuetzstellen der Interpolation.
-static const int      MAX_LOOKAHEAD      = 120;
+// Modellraster und P6-Fenster in physikalischer Zeit.
+static const double   DPSK_MODEL_RATE = 20'000'000.0;
+static constexpr double BD_PREFIX_US = 8.0;
+static constexpr double BD_DF_START_US = 3.6;
+static constexpr double BD_WINDOW_END_US = 42.0;
 
 // Zeitpunkte in us relativ zur Vorderflanke von P1 (ICAO Annex 10)
 namespace us {
@@ -72,15 +75,15 @@ enum MsgCode : uint8_t {
 };
 
 // Ratios als Fixed-Point Q8 (r * 256): a/b > r  <=>  a*256 > rq*b
-static inline int toQ8(float r) { return (int)lroundf(r * 256.0f); }
+static inline int toQ8(double r) { return (int)lround(r * 256.0); }
 
 struct Thresholds {
     int diff         = 10;   // Mindestabstand Puls/Rauschen (fern)
     int diffclose    = 5;    // Mindestabstand Puls/Rauschen (direkt daneben)
-    int ratio        = toQ8(0.25f);
-    int ratioclose   = toQ8(0.75f);
-    int ratiop4      = toQ8(0.50f);
-    int ratioclosep4 = toQ8(1.50f);
+    int ratio        = toQ8(0.25);
+    int ratioclose   = toQ8(0.75);
+    int ratiop4      = toQ8(0.50);
+    int ratioclosep4 = toQ8(1.50);
     int min_peak     = 0;    // mpa
     int max_nf       = 255;  // mnf
     int max_nfc      = 255;  // mnfc
@@ -126,8 +129,13 @@ struct Timing {
     int p4_gap = 5, p4_short = 2, p4_long = 4;
     int skip_s56 = 50, skip_s112 = 85;
     int min_skip_s = 0;        // Fallback ohne Decoder
+    int edge_step = 1;         // 0,4-us Abstand zu Pulsflanken
+    int edge_trim = 0;         // 0,1-us Toleranz an Pulsflanken
+    int mode_step = 1;         // sichere Stelle vor P6
 
     int s(double t_us) const { return (int)lround(t_us * sps); }
+    int ceil_s(double t_us) const { return (int)std::ceil(t_us * sps); }
+    int floor_s(double t_us) const { return (int)std::floor(t_us * sps); }
     double f(double t_us) const { return t_us * sps; }
 
     void init(uint32_t rate) {
@@ -142,8 +150,17 @@ struct Timing {
         skip_s56   = s(us::P6_END56);
         skip_s112  = s(us::P6_END112);
         min_skip_s = s(20.0);
+        edge_step  = std::max(1, floor_s(0.4));
+        edge_trim  = std::max(0, floor_s(0.1));
+        mode_step  = std::max(1, floor_s(0.2));
     }
-    int maxPulseIndex() const { return p3_c + pw + p4_gap + p4_long + 3; }
+    int maxPulseIndex() const {
+        return p3_c + pw + p4_gap + p4_long + edge_step + 1;
+    }
+    int lookaheadSamples() const {
+        return ceil_s(BD_PREFIX_US)
+            + std::max(maxPulseIndex(), ceil_s(BD_WINDOW_END_US) + 4);
+    }
 };
 
 // ---------- Qualitaetsmetrik eines demodulierten Uplinks ----------
@@ -184,6 +201,7 @@ struct State {
     uint32_t        iq_len = 0;      // gueltige Bytes in iq_buf
     bool            data_ready = false;
     bool            reader_done = false;
+    bool            reader_error = false;
     uint64_t        dropped = 0;     // verworfene Puffer (Main zu langsam)
 
     // Verarbeitung
@@ -191,6 +209,8 @@ struct State {
     std::vector<uint8_t>  iq_hist;   // Overlap + neue Samples (I/Q)
     std::vector<uint8_t>  mag;       // Overlap + neue Samples (Magnitude)
     uint32_t              overlap = 0;
+    uint32_t              prefix_keep = 0; // bereits gescannte Praefix-Historie am Pufferanfang
+    uint32_t              lookahead = 0;
     uint64_t              sample_base = 0; // absoluter Index von mag[0]
     std::vector<uint8_t>  lut16;     // 65536 Eintraege, Index = I | Q<<8
     std::vector<uint8_t>  order;     // Reihenfolge erkannter Codes
@@ -232,7 +252,7 @@ struct State {
     rtlsdr_dev_t *dev = nullptr;
     int fd = -1;
 
-    // Ausgabedirectory für JSONL und .cu8
+    // Ausgabedirectory fuer JSONL und .cu8
     std::string out_dir;
     bool        save_iq  = false;
     FILE*       jsonl_fp = nullptr;
@@ -248,8 +268,14 @@ static void sigHandler(int) {
     g_exit = true;   // nur async-signal-safe Operationen
 }
 
+static void closeOutputs();
+
+// Nur aus dem Main-Thread vor Start des Reader-Threads aufrufen.
 [[noreturn]] static void die(const char *msg) {
     fprintf(stderr, "Fehler: %s\n", msg);
+    if (G.dev) { rtlsdr_close(G.dev); G.dev = nullptr; }
+    if (G.fd >= 0) { close(G.fd); G.fd = -1; }
+    closeOutputs();
     exit(1);
 }
 
@@ -309,8 +335,6 @@ static void closeOutputs() {
     if (G.iq_fp)    { fflush(G.iq_fp);    fclose(G.iq_fp);    G.iq_fp    = nullptr; }
 }
 
-// ---------- JSONL/cu8 Ausgabe ----------
-
 static double monotonicSec() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -351,7 +375,8 @@ static void writeJsonlP6(uint64_t smp, int p1, int p2, const UplinkResult& R) {
     formatP6ProtocolJson(R, protocol_json, sizeof(protocol_json));
 
     fprintf(G.jsonl_fp,
-        "{\"type\":\"P6\",\"smp\":%llu,\"mono\":%.6f,\"uf\":%d,\"mode5\":%s,\"nbits\":%d,"
+        "{\"type\":\"P6\",\"smp\":%llu,\"mono\":%.6f,\"sample_rate\":%u,"
+        "\"uf\":%d,\"mode5\":%s,\"nbits\":%d,"
         "\"p1\":%d,\"p2\":%d,\"snr_db\":%.2f,\"df_hz\":%.1f,"
         "\"spr_us\":%.3f,\"lock\":%.3f,\"cov\":%.3f,\"p6min\":%.3f,"
         "\"p6snr_db\":%.2f,\"pre_snr_db\":%.2f,\"p6_p1_ratio\":%.2f,"
@@ -360,7 +385,7 @@ static void writeJsonlP6(uint64_t smp, int p1, int p2, const UplinkResult& R) {
         "\"data_min_margin\":%.4f,\"ap_min_margin\":%.4f,"
         "\"path_metric_gap\":%.6f%s,\"status\":\"%s\","
         "\"aa\":%s,\"aa_cnt\":%u,\"hex\":\"%s\"}\n",
-        (unsigned long long)smp, monotonicSec(),
+        (unsigned long long)smp, monotonicSec(), G.samplerate,
         (int)ufOf(R.bytes), R.mode5 ? "true" : "false", R.nbits,
         p1, p2, snr_db, R.freq_off_hz,
         R.spr_us, R.spr_score, R.p6_cov, R.p6_min_ratio, R.p6_snr_db,
@@ -370,16 +395,16 @@ static void writeJsonlP6(uint64_t smp, int p1, int p2, const UplinkResult& R) {
         status, aa_json,
         (!R.mode5 && R.has_addr)
             ? (unsigned)R.addrCnt : 0u, hex);
-    fflush(G.jsonl_fp);
 }
 
 static void writeJsonlSsr(const char* subtype, uint64_t smp, int p1, int p3, int p4, int code) {
     if (!G.jsonl_fp) return;
     fprintf(G.jsonl_fp,
         "{\"type\":\"SSR\",\"subtype\":\"%s\",\"smp\":%llu,\"mono\":%.6f,"
+        "\"sample_rate\":%u,"
         "\"p1\":%d,\"p3\":%d,\"p4\":%d,\"code\":%d}\n",
-        subtype, (unsigned long long)smp, monotonicSec(), p1, p3, p4, code);
-    fflush(G.jsonl_fp);
+        subtype, (unsigned long long)smp, monotonicSec(), G.samplerate,
+        p1, p3, p4, code);
 }
 
 static void writeJsonlP6Reject(uint64_t smp, int p1, int p2,
@@ -396,6 +421,7 @@ static void writeJsonlP6Reject(uint64_t smp, int p1, int p2,
     int uf = R.nbits > 0 ? (int)ufOf(R.bytes) : -1;
     fprintf(G.jsonl_fp,
         "{\"type\":\"P6_REJECTED\",\"smp\":%llu,\"mono\":%.6f,"
+        "\"sample_rate\":%u,"
         "\"reason\":\"%s\",\"uf\":%d,\"nbits\":%d,\"p1\":%d,\"p2\":%d,"
         "\"snr_db\":%.2f,\"df_hz\":%.1f,\"spr_us\":%.3f,\"lock\":%.3f,"
         "\"cov\":%.3f,\"p6min\":%.3f,\"p6snr_db\":%.2f,"
@@ -403,12 +429,11 @@ static void writeJsonlP6Reject(uint64_t smp, int p1, int p2,
         "\"q\":%u,\"viterbi_metric\":%.6f,\"mean_margin\":%.4f,"
         "\"min_margin\":%.4f,\"hex\":\"%s\"}\n",
         (unsigned long long)smp, monotonicSec(),
-        R.reject_reason ? R.reject_reason : "unknown",
+        G.samplerate, R.reject_reason ? R.reject_reason : "unknown",
         uf, R.nbits, p1, p2, snr_db, R.freq_off_hz, R.spr_us,
         R.spr_score, R.p6_cov, R.p6_min_ratio, R.p6_snr_db,
         R.pre_snr_db, R.p6_p1_ratio, R.pre_rho, (unsigned)R.quality,
         R.decoder_metric, R.mean_margin, R.min_margin, hex);
-    fflush(G.jsonl_fp);
 }
 
 
@@ -432,14 +457,14 @@ static void buildLut() {
 static uint32_t g_valid_samples = 0;
 
 static void ensureCapacity(uint32_t total) {
-    size_t need = (size_t)total + MAX_LOOKAHEAD;
+    size_t need = (size_t)total + G.lookahead;
     if (G.mag.size() < need)          G.mag.resize(need);
     if (G.iq_hist.size() < 2 * need)  G.iq_hist.resize(2 * need);
 }
 
 // Haengt iq_work[0..len) hinter den Overlap und berechnet die Magnitude.
 // Rueckgabe: Anzahl gueltiger Samples (Overlap + neue).
-static uint32_t computeMagnitude(uint32_t len) {
+static uint32_t computeMagnitude(uint32_t len, bool final) {
     uint32_t n_new = len / 2;                    // ungerades Byte ignorieren
     uint32_t total = G.overlap + n_new;
     ensureCapacity(total);
@@ -454,28 +479,37 @@ static uint32_t computeMagnitude(uint32_t len) {
     for (uint32_t j = 0; j < n_new; j++)
         m[j] = lut[src[2 * j] | (src[2 * j + 1] << 8)];
 
-    // Reserve: Magnitude 0, I/Q = 128 (Naeherung Nullpunkt 127,5).
-    std::fill(G.mag.begin() + total, G.mag.begin() + total + MAX_LOOKAHEAD, 0);
-    std::fill(G.iq_hist.begin() + 2 * (size_t)total,
-              G.iq_hist.begin() + 2 * ((size_t)total + MAX_LOOKAHEAD), 128);
+    if (final) {
+        std::fill(G.mag.begin() + total,
+                  G.mag.begin() + total + G.lookahead, 0);
+        std::fill(G.iq_hist.begin() + 2 * (size_t)total,
+                  G.iq_hist.begin() + 2 * ((size_t)total + G.lookahead),
+                  128);
+    }
     return total;
 }
 
-// Bewahrt die letzten MAX_LOOKAHEAD Samples beider Puffer synchron auf.
+// Bewahrt Praefix-Historie und ungescannten Lookahead synchron in beiden Puffern.
 static void keepOverlap(uint32_t total, uint32_t consumed) {
     if (consumed > total) consumed = total;
-    uint32_t keep = total - consumed;
-    if (keep > (uint32_t)MAX_LOOKAHEAD) {
-        consumed += keep - MAX_LOOKAHEAD;
-        keep = MAX_LOOKAHEAD;
+    const uint32_t prefix_samples =
+        static_cast<uint32_t>(G.tm.ceil_s(BD_PREFIX_US));
+    uint32_t tail = total - consumed;
+    if (tail > G.lookahead) {
+        consumed += tail - G.lookahead;
+        tail = G.lookahead;
     }
-    if (keep) {
-        memmove(G.mag.data(), G.mag.data() + consumed, keep);
-        memmove(G.iq_hist.data(), G.iq_hist.data() + 2 * (size_t)consumed,
+    const uint32_t history = std::min(prefix_samples, consumed);
+    const uint32_t start = consumed - history;
+    uint32_t keep = total - start;
+    if (keep && start > 0) {
+        memmove(G.mag.data(), G.mag.data() + start, keep);
+        memmove(G.iq_hist.data(), G.iq_hist.data() + 2 * (size_t)start,
                 2 * (size_t)keep);
     }
-    G.sample_base += consumed;
+    G.sample_base += start;
     G.overlap = keep;
+    G.prefix_keep = history;
 }
 
 static FILE *G_txt = stdout;
@@ -484,8 +518,10 @@ static FILE *G_txt = stdout;
 static inline bool ratioGt(int a, int b, int rq) { return a * 256 > rq * b; }
 
 static inline int pulseRef(const uint8_t *m, int start, int w) {
+    const int trim = std::min(G.tm.edge_trim, std::max(0, (w - 1) / 2));
     int r = 255;
-    for (int k = 0; k < w; k++) r = std::min<int>(r, m[start + k]);
+    for (int k = trim; k < w - trim; k++)
+        r = std::min<int>(r, m[start + k]);
     return r;
 }
 
@@ -505,8 +541,17 @@ static inline bool pauseClose(int v, int ref) {
 
 static bool pauseRange(const uint8_t *m, int from, int to, int ref) {
     if (from > to) return true;
-    if (!pauseClose(m[from], ref) || !pauseClose(m[to], ref)) return false;
-    for (int k = from + 1; k < to; k++)
+    const int guard = std::min(
+        G.tm.edge_trim, std::max(0, (to - from + 1) / 2)
+    );
+    for (int k = from; k < from + guard; ++k)
+        if (!pauseClose(m[k], ref)) return false;
+    for (int k = to - guard + 1; k <= to; ++k)
+        if (!pauseClose(m[k], ref)) return false;
+    if (guard == 0 &&
+        (!pauseClose(m[from], ref) || !pauseClose(m[to], ref)))
+        return false;
+    for (int k = from + guard; k < to - guard + 1; k++)
         if (!pauseFar(m[k], ref)) return false;
     return true;
 }
@@ -519,10 +564,10 @@ static inline bool pauseBetween(const uint8_t *m, int from, int to,
 // ---------- Detektion: P1 / Mode S / P3 / P4 ----------
 static bool checkP1(const uint8_t *m) {
     const Timing &T = G.tm;
-    if (m[0] <= G.th.min_peak || m[T.pw - 1] <= G.th.min_peak) return false;
+    if (!pulseOk(m, 0, T.pw)) return false;
     int r1 = pulseRef(m, 0, T.pw);
     if (r1 <= G.th.min_peak) return false;
-    return pauseClose(m[T.pw], r1) && pauseFar(m[T.pw + 1], r1);
+    return pauseFar(m[T.pw + T.edge_step], r1);
 }
 
 static bool checkModeS(const uint8_t *m) {
@@ -532,7 +577,7 @@ static bool checkModeS(const uint8_t *m) {
     int r2 = pulseRef(m, T.p2, T.pw);
     if (!pauseBetween(m, T.pw, T.p2 - 1, r1, r2)) return false;
     int ref = std::min(r1, r2);
-    return pauseClose(m[T.p2 + T.pw], ref) && pauseClose(m[T.p2 + T.pw + 1], ref);
+    return pauseClose(m[T.p2 + T.pw + T.mode_step], ref);
 }
 
 static bool checkP3(const uint8_t *m, int off) {
@@ -541,7 +586,7 @@ static bool checkP3(const uint8_t *m, int off) {
     int r1 = pulseRef(m, 0, T.pw);
     int r3 = pulseRef(m, off, T.pw);
     if (!pauseBetween(m, T.pw, off - 1, r1, r3)) return false;
-    return pauseClose(m[off + T.pw], r3) && pauseFar(m[off + T.pw + 1], r3);
+    return pauseFar(m[off + T.pw + T.edge_step], r3);
 }
 
 enum P4Type { P4_NONE = 0, P4_SHORT, P4_LONG };
@@ -557,20 +602,22 @@ static P4Type checkP4(const uint8_t *m, int os) {
     const uint8_t *p = m + os;
 
     auto before = [&](int ref) {
-        return p4Pause(p[-1], ref, true) && p4Pause(p[-2], ref, false) &&
-               p4Pause(p[-3], ref, true);
+        const int pulse_end_guard =
+            std::max(1, T.p4_gap - T.pw - T.edge_trim);
+        return p4Pause(p[-T.edge_step], ref, true)
+            && p4Pause(p[-2 * T.edge_step], ref, false)
+            && p4Pause(p[-pulse_end_guard], ref, true);
     };
 
     if (pulseOk(p, 0, T.p4_long)) {
         int r = pulseRef(p, 0, T.p4_long);
-        if (before(r) && p4Pause(p[T.p4_long], r, true))
+        if (before(r) && p4Pause(p[T.p4_long + T.edge_step], r, false))
             return P4_LONG;
     }
     if (pulseOk(p, 0, T.p4_short)) {
         int r = pulseRef(p, 0, T.p4_short);
         if (before(r) &&
-            p4Pause(p[T.p4_short], r, true) &&
-            p4Pause(p[T.p4_short + 1], r, false))
+            p4Pause(p[T.p4_short + T.edge_step], r, false))
             return P4_SHORT;
     }
     return P4_NONE;
@@ -648,9 +695,10 @@ struct SprLock { bool ok = false; double t_us = us::SPR; double score = 0.0; };
 
 static SprLock lockSpr(int i, double w) {
     SprLock L;
-    const double step = 0.05;
-    const int n = (int)lround((us::SPR_MAX - us::SPR_MIN) / step) + 1;
-    std::vector<double> sc((size_t)n);
+    constexpr double step = 0.05;
+    constexpr int n = static_cast<int>((us::SPR_MAX - us::SPR_MIN) / step + 0.5) + 1;
+    static_assert(n > 0 && n <= 64, "SPR-Suchraster ausserhalb gueltiger Grenzen");
+    std::array<double, n> sc{};
     int best = -1;
     for (int k = 0; k < n; k++) {
         sc[k] = sprScore(i, us::SPR_MIN + k * step, w);
@@ -707,6 +755,8 @@ struct DpskChannel {
     std::vector<float> kn;   // bekannter Anteil P1/P2/P6/SPR (20 MS/s)
     int   anchor = 265;      // Datenbeginn (ST_ANCHOR)
     float delay  = 0.f;      // Kanal-Laufzeit in 20-MS/s-Samples
+    uint32_t input_sample_rate = 0;
+    double model_sample_rate = DPSK_MODEL_RATE;
 
     static float interp(const std::vector<float>& y, double t) {
         if (t < 0 || t >= (double)y.size() - 1) return 0.f;
@@ -728,43 +778,99 @@ struct ViterbiResult {
     int   nsamp  = 0;
 };
 
-// r: Frame-Fenster (df-korrigiert), r[k] liegt bei Modellzeit off + 8k
-ViterbiResult viterbiDpsk(const DpskChannel& ch, const std::complex<float>* r, int nr,
-                          double off, float phi, float A, int n)
+struct ViterbiSample {
+    int w;
+    float kv;
+    float B[7];
+    std::complex<float> z;
+};
+
+struct ViterbiWorkspace {
+    std::vector<int> by_count;
+    std::vector<int> by_offset;
+    std::vector<int> by_cursor;
+    std::vector<std::pair<int, int>> sample_bucket; // (bucket, k)
+    std::vector<ViterbiSample> by_samples;
+    std::vector<float> met, nmet, margin, forward, backward;
+    std::vector<uint16_t> traceback;
+    std::vector<double> phase_x, phase_y, phase_weights;
+    std::vector<int8_t> chip;
+};
+
+static thread_local ViterbiWorkspace g_viterbi_workspace;
+
+// r: Frame-Fenster (df-korrigiert), r[k] liegt bei Modellzeit off + model_step * k
+static void viterbiDpsk(const DpskChannel& ch, const std::complex<float>* r, int nr,
+                        double off, double model_step, float phi, float A, int n,
+                        ViterbiResult& res)
 {
     constexpr int L = 7, S = 1 << (L - 1), H = (L - 1) / 2;
     const int N = n + 2;                                   // + 2 Guard-Chips
-    struct Smp { int w; float kv; float B[L]; std::complex<float> z; };
-    std::vector<std::vector<Smp>> by(N);
+    ViterbiWorkspace& ws = g_viterbi_workspace;
+    ws.by_count.assign(N, 0);
+    ws.sample_bucket.clear();
+    ws.sample_bucket.reserve(nr);
     const std::complex<float> der = std::polar(1.f / A, -phi);
 
     int ns = 0;
     for (int k = 0; k < nr; ++k) {
-        double t = off + 8.0 * k;
+        double t = off + model_step * k;
         int jc = (int)std::floor((t - ch.delay - ch.anchor) / 5.0);
         int w = jc - H, e = w + L - 1;
         if (e < 0 || w > N - 1) continue;
-        Smp s;
-        s.w = w; s.kv = ch.knv(t); s.z = r[k] * der;
-        for (int i = 0; i < L; ++i) s.B[i] = (w + i >= 0) ? ch.g(w + i, t) : 0.f;
-        by[std::min(e, N - 1)].push_back(s);
+        int bucket = std::min(e, N - 1);
+        ws.by_count[bucket]++;
+        ws.sample_bucket.emplace_back(bucket, k);
         ++ns;
     }
 
-    // Zustand: letzte 6 Chips, Bit 0 = jüngster, 1 = +1, 0 = -1
+    ws.by_offset.resize(N + 1);
+    ws.by_offset[0] = 0;
+    for (int j = 0; j < N; ++j)
+        ws.by_offset[j + 1] = ws.by_offset[j] + ws.by_count[j];
+    ws.by_cursor.assign(ws.by_offset.begin(), ws.by_offset.begin() + N);
+    ws.by_samples.resize(ns);
+
+    for (const auto& entry : ws.sample_bucket) {
+        int bucket = entry.first;
+        int k = entry.second;
+        double t = off + model_step * k;
+        int jc = (int)std::floor((t - ch.delay - ch.anchor) / 5.0);
+        int w = jc - H;
+        ViterbiSample& s = ws.by_samples[ws.by_cursor[bucket]++];
+        s.w = w;
+        s.kv = ch.knv(t);
+        s.z = r[k] * der;
+        for (int i = 0; i < L; ++i) s.B[i] = (w + i >= 0) ? ch.g(w + i, t) : 0.f;
+    }
+
+    // Zustand: letzte 6 Chips, Bit 0 = juengster, 1 = +1, 0 = -1
     constexpr int K = 2;
     const float INF = std::numeric_limits<float>::infinity();
-    std::vector<float> met(S * K, INF), nmet(S * K);
-    std::vector<float> margin(N, 0.f);
-    std::vector<uint16_t> tb((size_t)N * S * K);            // Vorgängerpfad
-    std::vector<float> forward((size_t)(N + 1) * S, INF);
+    auto& met = ws.met;
+    auto& nmet = ws.nmet;
+    auto& margin = ws.margin;
+    auto& tb = ws.traceback;
+    auto& forward = ws.forward;
+    auto& backward = ws.backward;
+    met.assign(S * K, INF);
+    nmet.resize(S * K);
+    margin.assign(N, 0.f);
+    tb.resize((size_t)N * S * K);                          // Vorgaengerpfad
+    forward.assign((size_t)(N + 1) * S, INF);
     met[0] = 0.f;                                          // nach SPR: alle -1
     forward[0] = 0.f;
+
+    const ViterbiSample* samples_ptr = ws.by_samples.data();
+    const int* offset_ptr = ws.by_offset.data();
 
     auto branchMetric = [&](int j, int st, int cb) {
         if (j >= n && cb != (st & 1)) return INF;
         float metric = 0.f;
-        for (const Smp& s : by[j]) {
+        const int begin = offset_ptr[j];
+        const int end = offset_ptr[j + 1];
+        for (int idx = begin; idx < end; ++idx) {
+            const ViterbiSample& s = samples_ptr[idx];
             float v = s.kv;
             for (int i = 0; i < L; ++i) {
                 int d = j - (s.w + i);
@@ -814,7 +920,7 @@ ViterbiResult viterbiDpsk(const DpskChannel& ch, const std::complex<float>* r, i
         met.swap(nmet);
     }
 
-    std::vector<float> backward((size_t)(N + 1) * S, INF);
+    backward.assign((size_t)(N + 1) * S, INF);
     for (int st = 0; st < S; ++st) {
         backward[(size_t)N * S + st] = 0.f;
     }
@@ -856,7 +962,7 @@ ViterbiResult viterbiDpsk(const DpskChannel& ch, const std::complex<float>* r, i
             margin[j] = std::min(
                 1.f,
                 std::fabs(metric1 - metric0)
-                    / std::max(1.f, best_metric)
+                    / std::max(1e-6f, best_metric)
             );
         }
     }
@@ -871,25 +977,33 @@ ViterbiResult viterbiDpsk(const DpskChannel& ch, const std::complex<float>* r, i
         }
     }
 
-    auto traceback = [&](int final_path) {
-        std::vector<int8_t> chip(N);
-        for (int j = N - 1, path = final_path; j >= 0; --j) {
-            const int st = path / K;
-            chip[j] = (st & 1) ? 1 : -1;
-            path = tb[(size_t)j * S * K + path];
-        }
-        return chip;
-    };
-    const std::vector<int8_t> chip = traceback(best);
+    auto& chip = ws.chip;
+    chip.resize(N);
+    for (int j = N - 1, path = best; j >= 0; --j) {
+        const int st = path / K;
+        chip[j] = (st & 1) ? 1 : -1;
+        path = tb[(size_t)j * S * K + path];
+    }
 
-    ViterbiResult res;
     res.nsamp  = ns;
     res.metric = met[best] / std::max(1, ns);
-    std::vector<double> phase_x;
-    std::vector<double> phase_y;
-    std::vector<double> phase_weights;
+    res.path_metric_gap = (second >= 0)
+        ? (met[second] - met[best]) / std::max(1, ns)
+        : -1.f;
+    res.residual_w = 0.0;
+    res.residual_coherence = 0.0;
+
+    auto& phase_x = ws.phase_x;
+    auto& phase_y = ws.phase_y;
+    auto& phase_weights = ws.phase_weights;
+    phase_x.clear();
+    phase_y.clear();
+    phase_weights.clear();
+    phase_x.reserve(nr);
+    phase_y.reserve(nr);
+    phase_weights.reserve(nr);
     for (int k = 0; k < nr; ++k) {
-        double t = off + 8.0 * k;
+        double t = off + model_step * k;
         int jc = (int)std::floor((t - ch.delay - ch.anchor) / 5.0);
         int w = jc - H, e = w + L - 1;
         if (e < 0 || w > N - 1) continue;
@@ -968,10 +1082,6 @@ ViterbiResult viterbiDpsk(const DpskChannel& ch, const std::complex<float>* r, i
             }
         }
     }
-    if (second >= 0) {
-        res.path_metric_gap =
-            (met[second] - met[best]) / std::max(1, ns);
-    }
     res.margin.resize(n);
     for (int j = 0; j < n; ++j) res.margin[j] = margin[j];
     res.bits.resize(n);
@@ -980,7 +1090,6 @@ ViterbiResult viterbiDpsk(const DpskChannel& ch, const std::complex<float>* r, i
         res.bits[j] = (chip[j] != prev);
         prev = chip[j];
     }
-    return res;
 }
 // =================== Ende Viterbi-DPSK ===================
 
@@ -992,9 +1101,45 @@ bool loadDpskChannel(const char* path, DpskChannel& ch)
     std::ifstream f(path);
     std::string magic;
     int ng = 0, nk = 0;
-    if (!(f >> magic >> ch.anchor >> ch.delay >> ng >> nk) || magic != "DPSKCHAN1"
-        || ng <= 0 || nk <= 0 || ng > 100000 || nk > 100000) {
+    if (!(f >> magic)) {
+        fprintf(stderr, "Kanaldatei %s leer\n", path);
+        return false;
+    }
+    bool header_ok = false;
+    if (magic == "DPSKCHAN1") {
+        ch.input_sample_rate = DEFAULT_RATE;
+        ch.model_sample_rate = DPSK_MODEL_RATE;
+        header_ok = static_cast<bool>(
+            f >> ch.anchor >> ch.delay >> ng >> nk
+        );
+    } else if (magic == "DPSKCHAN2") {
+        double input_rate = 0.0;
+        double model_rate = 0.0;
+        header_ok = static_cast<bool>(
+            f >> input_rate >> model_rate
+              >> ch.anchor >> ch.delay >> ng >> nk
+        );
+        const bool finite_input =
+            header_ok && std::isfinite(input_rate) &&
+            std::isfinite(model_rate) && input_rate > 0.0 &&
+            input_rate <= UINT32_MAX;
+        const double rounded_input = finite_input ? lround(input_rate) : 0.0;
+        if (finite_input && rounded_input > 0.0 &&
+            std::abs(input_rate - rounded_input) <= 1e-3) {
+            ch.input_sample_rate = static_cast<uint32_t>(rounded_input);
+        } else {
+            header_ok = false;
+        }
+        ch.model_sample_rate = model_rate;
+    }
+    if (!header_ok || ng <= 0 || nk <= 0 || ng > 100000 || nk > 100000) {
         fprintf(stderr, "Kanaldatei %s ungueltig\n", path);
+        return false;
+    }
+    if (std::abs(ch.model_sample_rate - DPSK_MODEL_RATE) > 1.0) {
+        fprintf(stderr,
+                "Kanaldatei %s verwendet Modellrate %.0f, erwartet %.0f Hz\n",
+                path, ch.model_sample_rate, DPSK_MODEL_RATE);
         return false;
     }
     ch.g0.resize(ng);
@@ -1003,13 +1148,18 @@ bool loadDpskChannel(const char* path, DpskChannel& ch)
     for (auto& v : ch.kn) if (!(f >> v)) { fprintf(stderr, "Kanaldatei: kn zu kurz\n"); return false; }
     float e = 0.f;
     for (float v : ch.g0) e += v;
-    fprintf(stderr, "Kanal geladen: %s  anchor %d  delay %.2f  g0 %d  kn %d  sum(g0) %.3f\n",
-            path, ch.anchor, ch.delay, ng, nk, e);
+    fprintf(stderr,
+            "Kanal geladen: %s  input %u Hz model %.0f Hz "
+            "anchor %d delay %.2f g0 %d kn %d sum(g0) %.3f\n",
+            path, ch.input_sample_rate, ch.model_sample_rate,
+            ch.anchor, ch.delay, ng, nk, e);
     return true;
 }
 
 // ===================== Blind-Decode (Paket 3) =====================
-constexpr int BD_WIN = 125;          // Fenster ab 20 Samples (8 µs) vor P1
+static inline double modelTicksPerInputSample() {
+    return DPSK_MODEL_RATE / (double)G.samplerate;
+}
 
 struct BlindResult {
     ViterbiResult v;
@@ -1019,43 +1169,57 @@ struct BlindResult {
     double rho = 0.0;
 };
 
-// wie rt_frame: Fenster holen, df schätzen und entfernen
+// wie rt_frame: Fenster holen, df schaetzen und entfernen
 static bool bdFrame(const uint8_t* iq, size_t nPairs, long k, int n,
-                    std::complex<float>* r, double& dfHz)
+                    std::vector<std::complex<float>>& r, double& dfHz)
 {
-    long s0 = k - 20;
-    if (k < 0 || (size_t)(k + BD_WIN - 20) > nPairs) return false;
-    const int prefix = std::max<long>(0, -s0);
-    std::fill(r, r + BD_WIN, std::complex<float>(0.0f, 0.0f));
-    const size_t source = (size_t)std::max<long>(0, s0);
-    for (int j = prefix; j < BD_WIN; ++j) {
-        const size_t sample = source + (size_t)(j - prefix);
+    const int prefix_samples = G.tm.ceil_s(BD_PREFIX_US);
+    const int window_samples =
+        G.tm.ceil_s(BD_PREFIX_US + BD_WINDOW_END_US) + 1;
+    const long s0 = k - prefix_samples;
+    if (s0 + window_samples <= 0 ||
+        s0 + window_samples > static_cast<long>(nPairs))
+        return false;
+    r.assign((size_t)window_samples, std::complex<float>(0.0f, 0.0f));
+    const int first = static_cast<int>(std::max<long>(0, -s0));
+    for (int j = first; j < window_samples; ++j) {
+        const size_t sample = static_cast<size_t>(s0 + j);
         r[j] = {
             iq[2 * sample] - 127.5f,
             iq[2 * sample + 1] - 127.5f
         };
     }
-    int end = 20 + (n == 56 ? 49 : 84);
+    int df_start = prefix_samples + G.tm.s(BD_DF_START_US);
+    int data_end = prefix_samples + G.tm.s(
+        n == 56 ? us::P6_END56 : us::P6_END112
+    );
+    df_start = std::max(1, std::min(df_start, window_samples - 1));
+    data_end = std::max(df_start + 1, std::min(data_end, window_samples));
+    const int df_lag = std::max(1, G.tm.s(0.4));
+    df_start = std::max(df_start, df_lag);
     std::complex<double> acc = 0;
-    for (int j = 29; j < end; ++j) {
-        std::complex<double> d = std::complex<double>(r[j]) * std::conj(std::complex<double>(r[j - 1]));
+    for (int j = df_start; j < data_end; ++j) {
+        std::complex<double> d =
+            std::complex<double>(r[j])
+            * std::conj(std::complex<double>(r[j - df_lag]));
         acc += d * d;
     }
-    double w = (acc != 0.0) ? std::arg(acc) / 2 : 0.0;
-    for (int j = 0; j < BD_WIN; ++j)
+    double w = (acc != 0.0) ? std::arg(acc) / (2.0 * df_lag) : 0.0;
+    for (int j = 0; j < window_samples; ++j)
         r[j] *= std::complex<float>(std::polar(1.0, -w * j));
-    dfHz = w * 2.5e6 / (2 * M_PI);
+    dfHz = w * (double)G.samplerate / (2 * M_PI);
     return true;
 }
 
 // wie st_pre_fit
-static bool bdPreFit(const DpskChannel& ch, const std::complex<float>* r, double c,
+static bool bdPreFit(const DpskChannel& ch, const std::complex<float>* r, int nr,
+                     double c, double model_step,
                      std::complex<double>& num, double& den, double& sigEnergy)
 {
     double lim = ch.anchor + ch.delay - 10;
     num = 0; den = 0; sigEnergy = 0;
-    for (int k = 0; k < BD_WIN; ++k) {
-        double t = c + 8.0 * k;
+    for (int k = 0; k < nr; ++k) {
+        double t = c + model_step * k;
         if (t >= lim) break;
         double kv = ch.knv(t);
         std::complex<double> rk(r[k]);
@@ -1066,17 +1230,24 @@ static bool bdPreFit(const DpskChannel& ch, const std::complex<float>* r, double
     return den > 0 && sigEnergy > 0;
 }
 
-// wie st_blind_decode: Grobtiming per Präambel, Feintiming per Viterbi-Metrik
+// wie st_blind_decode: Grobtiming per Praeambel, Feintiming per Viterbi-Metrik
 bool blindDecodeDpsk(const DpskChannel& ch, const uint8_t* iq, size_t nPairs,
                      long k, int n, BlindResult& out)
 {
-    std::complex<float> r[BD_WIN];
+    static thread_local std::vector<std::complex<float>> r;
+    static thread_local ViterbiResult cand;
     if (!bdFrame(iq, nPairs, k, n, r, out.dfHz)) return false;
-
+    const int sample_count = (int)r.size();
+    const double model_step = modelTicksPerInputSample();
+    const double frame_origin =
+    BD_PREFIX_US * (DPSK_MODEL_RATE / 1e6)
+    - G.tm.ceil_s(BD_PREFIX_US) * model_step;
+    
     int bestC = 0; double bestS = -1;
     std::complex<double> num; double den, sigE;
     for (int c = -24; c <= 32; ++c)
-        if (bdPreFit(ch, r, c, num, den, sigE)) {
+        if (bdPreFit(ch, r.data(), sample_count, frame_origin + c, model_step,
+                     num, den, sigE)) {
             double s = std::norm(num) / den;
             if (s > bestS) { bestS = s; bestC = c; }
         }
@@ -1085,11 +1256,14 @@ bool blindDecodeDpsk(const DpskChannel& ch, const uint8_t* iq, size_t nPairs,
     bool have = false;
     for (int cc = bestC - G.p6_timing_radius;
          cc <= bestC + G.p6_timing_radius; ++cc) {
-        if (!bdPreFit(ch, r, cc, num, den, sigE)) continue;
+        const double off = frame_origin + cc;
+        if (!bdPreFit(ch, r.data(), sample_count, off, model_step,
+                      num, den, sigE)) continue;
         float phi = (float)std::arg(num), A = (float)(std::abs(num) / den);
-        ViterbiResult v = viterbiDpsk(ch, r, BD_WIN, cc, phi, A, n);
-        if (!have || v.metric < out.v.metric) {
-            out.v = v; out.c = cc; out.phi = phi; out.A = A;
+        viterbiDpsk(ch, r.data(), sample_count, off, model_step, phi, A, n, cand);
+        if (!have || cand.metric < out.v.metric) {
+            std::swap(out.v, cand);
+            out.c = off; out.phi = phi; out.A = A;
             out.rho = std::norm(num) / (den * sigE);
             have = true;
         }
@@ -1100,24 +1274,24 @@ bool blindDecodeDpsk(const DpskChannel& ch, const uint8_t* iq, size_t nPairs,
         const double initial_df_hz = out.dfHz;
         if (std::abs(residual_w) > 1e-9
             && out.v.residual_coherence >= 0.05) {
-            for (int j = 0; j < BD_WIN; ++j) {
+            for (int j = 0; j < sample_count; ++j) {
                 r[j] *= std::complex<float>(
                     std::polar(1.0, -residual_w * j)
                 );
             }
-            if (bdPreFit(ch, r, out.c, num, den, sigE)) {
+            if (bdPreFit(ch, r.data(), sample_count, out.c, model_step,
+                         num, den, sigE)) {
                 float phi = (float)std::arg(num);
                 float A = (float)(std::abs(num) / den);
-                ViterbiResult refined = viterbiDpsk(
-                    ch, r, BD_WIN, out.c, phi, A, n
-                );
-                if (refined.metric < initial_metric) {
-                    out.v = refined;
+                viterbiDpsk(ch, r.data(), sample_count, out.c, model_step,
+                            phi, A, n, cand);
+                if (cand.metric < initial_metric) {
+                    std::swap(out.v, cand);
                     out.phi = phi;
                     out.A = A;
                     out.rho = std::norm(num) / (den * sigE);
                     out.dfHz = initial_df_hz
-                        + residual_w * 2.5e6 / (2.0 * M_PI);
+                        + residual_w * (double)G.samplerate / (2.0 * M_PI);
                 }
             }
         }
@@ -1242,11 +1416,13 @@ static double medianMagnitude(int i, double t0_us, double t1_us) {
     int a = i + (int)std::ceil(T.f(t0_us));
     int b = i + (int)std::floor(T.f(t1_us));
     if (a < 0 || b >= (int)g_valid_samples || b < a) return -1.0;
-    std::vector<int> values;
+    static thread_local std::vector<int> values;
+    values.clear();
     values.reserve((size_t)(b - a + 1));
     for (int k = a; k <= b; ++k) values.push_back(G.mag[k]);
-    std::sort(values.begin(), values.end());
-    return values[values.size() / 2];
+    auto middle = values.begin() + values.size() / 2;
+    std::nth_element(values.begin(), middle, values.end());
+    return *middle;
 }
 
 static void evalP6Envelope(int i, int p1_ref, int nbits,
@@ -1332,7 +1508,7 @@ static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
         return R;
     }
 
-    BlindResult blind;
+    static thread_local BlindResult blind;
     const size_t nPairs = g_valid_samples;
     bool blind_ready = blindDecodeDpsk(
         g_chan, G.iq_hist.data(), nPairs, i, nbits, blind
@@ -1671,8 +1847,9 @@ static uint32_t detectBlock(uint32_t total, bool final) {
     const Timing &T = G.tm;
     const uint8_t *mag = G.mag.data();
     uint32_t limit = final ? total
-                   : (total > (uint32_t)MAX_LOOKAHEAD ? total - MAX_LOOKAHEAD : 0);
-    uint32_t i = 0;
+                   : (total > G.lookahead ? total - G.lookahead : 0);
+    uint32_t i = G.prefix_keep;
+    if (i >= limit) return i;
 
     if (G.print_all) {
         for (uint32_t k = G.overlap; k < total; k++) fprintf(G_txt, " %u", mag[k]);
@@ -1695,7 +1872,7 @@ static uint32_t detectBlock(uint32_t total, bool final) {
         if (mode_s_preamble && handleModeS(m, i, r1, skip, R)) {
             code  = MSG_S;
             haveR = G.uplink_decode;
-            show  = T.p2 + T.pw + 2;
+            show  = T.p2 + T.pw + T.edge_step;
             if (G.baseline) {
                 addPulse(m, 0, T.pw);
                 addPulse(m, T.p2, T.pw);
@@ -1710,7 +1887,7 @@ static uint32_t detectBlock(uint32_t total, bool final) {
             if (off) {
                 const bool isA = (off == T.p3_a);
                 const int  os  = off + T.p4_gap;
-                show = os + T.p4_long + 1;
+                show = os + T.p4_long + T.edge_step;
                 switch (checkP4(m, os)) {
                 case P4_SHORT:
                     code = isA ? MSG_A_ACAC : MSG_C_ACAC;
@@ -1722,20 +1899,20 @@ static uint32_t detectBlock(uint32_t total, bool final) {
                     break;
                 default:
                     code = isA ? MSG_A : MSG_C;
-                    skip = off + T.pw + 2;
+                    skip = off + T.pw + T.edge_step;
                     if (G.baseline) {
                         addPulse(m, 0, T.pw);
                         addPulse(m, off, T.pw);
                         addPause(m, T.pw, off - 1);
                         G.avg_nfc.add(m[off + T.pw]);
-                        G.avg_nf.add(m[off + T.pw + 1]);
+                        G.avg_nf.add(m[off + T.pw + T.edge_step]);
                     }
                     break;
                 }
             }
         }
 
-if (code != MSG_NONE) {
+        if (code != MSG_NONE) {
             G.cur.count(code);
             if (G.print_order) G.order.push_back(code);
 
@@ -1745,7 +1922,7 @@ if (code != MSG_NONE) {
                 p2 = std::max<int>(p2, m[T.p2 + k]);
             }
             if (code == MSG_S && haveR && R.valid) {
-                emitP6(pos, p1, p2, R, m, std::min(show, 32));
+                emitP6(pos, p1, p2, R, m, show);
             } else {
                 if (code == MSG_S && haveR)
                     writeJsonlP6Reject(pos, p1, p2, R);
@@ -1824,13 +2001,13 @@ static void printBaseline() {
     fputc('\n', G_txt);
 }
 
-static void printStats(uint32_t samples) {
+static void printStats(uint64_t samples) {
     if (G.cur.total() == 0) {
         if (!G.continuous) fprintf(G_txt, "Keine Nachrichten erkannt.\n");
     } else {
         char title[96];
         snprintf(title, sizeof(title),
-                 "Statistik fuer %u Samples (%.1f ms):", samples,
+                 "Statistik fuer %" PRIu64 " Samples (%.1f ms):", samples,
                  samples * 1000.0 / G.samplerate);
         printCounters(title, G.cur);
         if (G.continuous) {
@@ -1919,13 +2096,8 @@ static void rtlsdrCallback(unsigned char *buf, uint32_t len, void *) {
 
 // ---------- Datei-Eingabe ----------
 static void readFile() {
-    G.fd = open(G.filename, O_RDONLY);
-    if (G.fd < 0) {
-        fprintf(stderr, "Fehler: Datei '%s' nicht lesbar: %s\n",
-                G.filename, strerror(errno));
-        exit(1);
-    }
     std::vector<uint8_t> tmp(G.data_len);
+    bool io_error = false;
     while (!g_exit) {
         size_t got = 0;
         while (got < tmp.size()) {
@@ -1933,6 +2105,7 @@ static void readFile() {
             if (n < 0) {
                 if (errno == EINTR) continue;
                 fprintf(stderr, "Lesefehler: %s\n", strerror(errno));
+                io_error = true;
                 break;
             }
             if (n == 0) break;
@@ -1948,14 +2121,17 @@ static void readFile() {
             G.iq_len = (uint32_t)got;
             G.data_ready = true;
         }
-        bool eof = got < tmp.size();
+        bool eof = io_error || got < tmp.size();
+        if (io_error) G.reader_error = true;
         if (eof) G.reader_done = true;
         pthread_cond_broadcast(&G.cond);
         pthread_mutex_unlock(&G.mutex);
         if (eof) break;
     }
-    close(G.fd);
-    G.fd = -1;
+    if (G.fd >= 0) {
+        close(G.fd);
+        G.fd = -1;
+    }
 }
 
 // ---------- Reader-Thread ----------
@@ -1964,8 +2140,12 @@ static void *readerThread(void *) {
         readFile();
     } else {
         int r = rtlsdr_read_async(G.dev, rtlsdrCallback, nullptr, 0, G.data_len);
-        if (r < 0 && !g_exit)
+        if (r < 0 && !g_exit) {
             fprintf(stderr, "Fehler: rtlsdr_read_async() lieferte %d\n", r);
+            pthread_mutex_lock(&G.mutex);
+            G.reader_error = true;
+            pthread_mutex_unlock(&G.mutex);
+        }
         pthread_mutex_lock(&G.mutex);
         G.reader_done = true;
         pthread_cond_broadcast(&G.cond);
@@ -1982,9 +2162,9 @@ static void showHelp() {
 "  --device <n>            RTL-SDR-Geraeteindex (Default 0)\n"
 "  --file <pfad>           Rohdatei (8-Bit-I/Q) statt RTL-SDR\n"
 "  --gain <dB|auto|max>    Tuner-Gain in dB (Default max)\n"
-"  --samplerate <r>        2.4..3.2 MS/s oder Hz (Default 2.5). Bei --file:\n"
+"  --samplerate <r>        2.4..30 MS/s oder Hz (Default 2.5). Bei --file:\n"
 "                          MUSS der Rate der Aufzeichnung entsprechen!\n"
-"                          --chan erfordert exakt 2.5 MS/s.\n"
+"                          --chan muss zur Trainingsrate passen.\n"
 "  --ppm <-200..200>       Frequenzkorrektur des Tuners in ppm\n"
 "  --agc                   RTL2832-AGC aktivieren\n"
 "  --size <bytes>          Blockgroesse, Vielfaches von 16384, min. 16384\n"
@@ -2040,10 +2220,10 @@ static long parseLong(const char *opt, const char *s, long lo, long hi) {
     return v;
 }
 
-static float parseFloat(const char *opt, const char *s, float lo, float hi) {
+static double parseFloat(const char *opt, const char *s, double lo, double hi) {
     char *end = nullptr;
     errno = 0;
-    float v = strtof(s, &end);
+    double v = strtod(s, &end);
     if (errno || end == s || *end || !(v >= lo && v <= hi)) {
         fprintf(stderr, "Fehler: %s erwartet Zahl %.2f..%.2f, nicht '%s'\n",
                 opt, lo, hi, s);
@@ -2067,10 +2247,10 @@ static void parseArgs(int argc, char **argv) {
             const char *v = needArg(argc, argv, i);
             if (!strcmp(v, "auto"))     G.gain = AUTO_GAIN;
             else if (!strcmp(v, "max")) G.gain = MAX_GAIN;
-            else G.gain = (int)lroundf(parseFloat(a, v, 0.0f, 60.0f) * 10.0f);
+            else G.gain = (int)lround(parseFloat(a, v, 0.0, 60.0) * 10.0);
         } else if (!strcmp(a, "--samplerate")) {
             const char *v = needArg(argc, argv, i);
-            double r = parseFloat(a, v, 0.0f, 4.0e6f);
+            double r = parseFloat(a, v, 0.0, 31.0e6);
             if (r < 100.0) r *= 1e6;
             uint32_t rate = (uint32_t)lround(r);
             if (rate < MIN_RATE || rate > MAX_RATE) {
@@ -2096,13 +2276,13 @@ static void parseArgs(int argc, char **argv) {
         } else if (!strcmp(a, "--diffclose")) {
             t.diffclose = (int)parseLong(a, needArg(argc, argv, i), 0, 255);
         } else if (!strcmp(a, "--diffratio")) {
-            t.ratio = toQ8(parseFloat(a, needArg(argc, argv, i), 0.0f, 4.0f));
+            t.ratio = toQ8(parseFloat(a, needArg(argc, argv, i), 0.0, 4.0));
         } else if (!strcmp(a, "--diffratioclose")) {
-            t.ratioclose = toQ8(parseFloat(a, needArg(argc, argv, i), 0.0f, 4.0f));
+            t.ratioclose = toQ8(parseFloat(a, needArg(argc, argv, i), 0.0, 4.0));
         } else if (!strcmp(a, "--diffratiop4")) {
-            t.ratiop4 = toQ8(parseFloat(a, needArg(argc, argv, i), 0.0f, 4.0f));
+            t.ratiop4 = toQ8(parseFloat(a, needArg(argc, argv, i), 0.0, 4.0));
         } else if (!strcmp(a, "--diffratioclosep4")) {
-            t.ratioclosep4 = toQ8(parseFloat(a, needArg(argc, argv, i), 0.0f, 4.0f));
+            t.ratioclosep4 = toQ8(parseFloat(a, needArg(argc, argv, i), 0.0, 4.0));
         } else if (!strcmp(a, "--mpa")) {
             t.min_peak = (int)parseLong(a, needArg(argc, argv, i), 0, 255);
         } else if (!strcmp(a, "--mnf")) {
@@ -2128,17 +2308,17 @@ static void parseArgs(int argc, char **argv) {
         } else if (!strcmp(a, "--p6-quality")) {
             G.p6_min_quality = (int)parseLong(a, needArg(argc, argv, i), 0, 255);
         } else if (!strcmp(a, "--p6-coverage")) {
-            G.p6_min_coverage = parseFloat(a, needArg(argc, argv, i), 0.0f, 1.0f);
+            G.p6_min_coverage = parseFloat(a, needArg(argc, argv, i), 0.0, 1.0);
         } else if (!strcmp(a, "--p6-snr")) {
-            G.p6_min_snr_db = parseFloat(a, needArg(argc, argv, i), -60.0f, 120.0f);
+            G.p6_min_snr_db = parseFloat(a, needArg(argc, argv, i), -60.0, 120.0);
         } else if (!strcmp(a, "--p6-pre-snr")) {
-            G.p6_min_pre_snr_db = parseFloat(a, needArg(argc, argv, i), -60.0f, 120.0f);
+            G.p6_min_pre_snr_db = parseFloat(a, needArg(argc, argv, i), -60.0, 120.0);
         } else if (!strcmp(a, "--p6-p1-ratio")) {
-            G.p6_max_p1_ratio = parseFloat(a, needArg(argc, argv, i), 0.0f, 20.0f);
+            G.p6_max_p1_ratio = parseFloat(a, needArg(argc, argv, i), 0.0, 20.0);
         } else if (!strcmp(a, "--p6-rho")) {
-            G.p6_min_rho = parseFloat(a, needArg(argc, argv, i), 0.0f, 1.0f);
+            G.p6_min_rho = parseFloat(a, needArg(argc, argv, i), 0.0, 1.0);
         } else if (!strcmp(a, "--p6-lock")) {
-            G.p6_min_lock = parseFloat(a, needArg(argc, argv, i), 0.0f, 1.0f);
+            G.p6_min_lock = parseFloat(a, needArg(argc, argv, i), 0.0, 1.0);
         } else if (!strcmp(a, "--p6-timing-radius")) {
             G.p6_timing_radius =
                 (int)parseLong(a, needArg(argc, argv, i), 0, 8);
@@ -2150,12 +2330,6 @@ static void parseArgs(int argc, char **argv) {
             showHelp();
             exit(1);
         }
-    }
-
-    if (g_haveChan && G.samplerate != DEFAULT_RATE) {
-        fprintf(stderr, "--chan benoetigt exakt 2.5 MS/s; angefordert: %u Hz\n",
-                G.samplerate);
-        std::exit(1);
     }
     if (G.uplink_decode && !g_haveChan)
         die("--uplink-decode benoetigt --chan");
@@ -2194,13 +2368,14 @@ static void processBlock(uint32_t len, bool last) {
         fwrite(G.iq_work.data(), 1, len & ~(uint32_t)1, G.iq_fp);
     }
 
-    uint32_t total = computeMagnitude(len);
+    uint32_t total = computeMagnitude(len, last);
     g_valid_samples = total;
     uint32_t consumed = detectBlock(total, last);
     keepOverlap(total, consumed);
     g_samples += len / 2;
     if (G.continuous) {
-        printStats((uint32_t)g_samples);
+        printStats(g_samples);
+        if (G.jsonl_fp) fflush(G.jsonl_fp);
         g_samples = 0;
     }
 }
@@ -2208,25 +2383,49 @@ static void processBlock(uint32_t len, bool last) {
 // ---------- main ----------
 int main(int argc, char **argv) {
     parseArgs(argc, argv);
-    if (!initOutputs()) return 1;
-    buildLut();
-    if (!G.filename) initRtlsdr();
+    if (!G.filename) {
+        initRtlsdr();
+    } else {
+        G.fd = open(G.filename, O_RDONLY);
+        if (G.fd < 0) {
+            fprintf(stderr, "Fehler: Datei '%s' nicht lesbar: %s\n",
+                    G.filename, strerror(errno));
+            return 1;
+        }
+    }
     G.tm.init(G.samplerate);
-
-    const int need = std::max(G.tm.maxPulseIndex(), G.tm.skip_s112 + 4);
-    if (need > MAX_LOOKAHEAD) {
-        fprintf(stderr, "Interner Fehler: MAX_LOOKAHEAD=%d < benoetigt %d\n",
-                MAX_LOOKAHEAD, need);
+    if (g_haveChan) {
+        const double rate_error = std::abs(
+            (double)g_chan.input_sample_rate - (double)G.samplerate
+        ) / std::max<double>(1.0, G.samplerate);
+        if (rate_error > 0.001) {
+            fprintf(stderr,
+                    "Kanaldatei wurde bei %u Hz trainiert; "
+                    "Eingangsrate ist %u Hz\n",
+                    g_chan.input_sample_rate, G.samplerate);
+            if (G.dev) { rtlsdr_close(G.dev); G.dev = nullptr; }
+            if (G.fd >= 0) { close(G.fd); G.fd = -1; }
+            return 1;
+        }
+    }
+    if (!initOutputs()) {
+        if (G.dev) { rtlsdr_close(G.dev); G.dev = nullptr; }
+        if (G.fd >= 0) { close(G.fd); G.fd = -1; }
         return 1;
     }
+    buildLut();
+
+    G.lookahead = (uint32_t)G.tm.lookaheadSamples();
     if (G.uplink_decode)
         fprintf(stderr, "Hinweis: --uplink-decode ist experimentell und nicht "
                         "validiert (Quality-Gates in JSONL beachten)\n");
 
     G.iq_buf.resize(G.data_len);
     G.iq_work.resize(G.data_len);
-    G.mag.resize(G.data_len / 2 + 2 * MAX_LOOKAHEAD);
-    G.iq_hist.resize(2 * ((size_t)G.data_len / 2 + 2 * MAX_LOOKAHEAD));
+    G.mag.resize((size_t)G.data_len / 2 + 2 * (size_t)G.lookahead);
+    G.iq_hist.resize(
+        2 * ((size_t)G.data_len / 2 + 2 * (size_t)G.lookahead)
+    );
 
     struct sigaction sa{};
     sa.sa_handler = sigHandler;
@@ -2235,8 +2434,13 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, nullptr);
     signal(SIGPIPE, SIG_IGN);
 
-    if (pthread_create(&G.reader_thread, nullptr, readerThread, nullptr) != 0)
-        die("Reader-Thread konnte nicht gestartet werden");
+    if (pthread_create(&G.reader_thread, nullptr, readerThread, nullptr) != 0) {
+        fprintf(stderr, "Fehler: Reader-Thread konnte nicht gestartet werden\n");
+        if (G.dev) { rtlsdr_close(G.dev); G.dev = nullptr; }
+        if (G.fd >= 0) { close(G.fd); G.fd = -1; }
+        closeOutputs();
+        return 1;
+    }
 
     const bool single = !G.filename && !G.continuous;
     while (!g_exit) {
@@ -2244,7 +2448,7 @@ int main(int argc, char **argv) {
         uint32_t len = fetchBlock(last);
         if (len == 0) {
             if (last) {
-                if (G.overlap) processBlock(0, true);
+                if (G.overlap > G.prefix_keep) processBlock(0, true);
                 break;
             }
             continue;
@@ -2253,7 +2457,7 @@ int main(int argc, char **argv) {
         if (single || last) break;
     }
 
-    if (!G.continuous) printStats((uint32_t)g_samples);
+    if (!G.continuous) printStats(g_samples);
     if (G.dropped)
         fprintf(stderr, "Warnung: %" PRIu64 " Puffer verworfen "
                         "(Verarbeitung zu langsam)\n", G.dropped);
@@ -2261,7 +2465,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Uplink-Decoder: %" PRIu64 " akzeptiert\n",
                 G.uplink_ok);
     }
-
 
     // ---------- Aufraeumen ----------
     g_exit = true;
@@ -2272,6 +2475,9 @@ int main(int argc, char **argv) {
     pthread_join(G.reader_thread, nullptr);
 
     if (G.dev) { rtlsdr_close(G.dev); G.dev = nullptr; }
+    if (G.fd >= 0) { close(G.fd); G.fd = -1; }
     closeOutputs();
-    return 0;
+    pthread_cond_destroy(&G.cond);
+    pthread_mutex_destroy(&G.mutex);
+    return G.reader_error ? 1 : 0;
 }

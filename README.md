@@ -11,7 +11,7 @@ Fork of [dump1030 by Fuziih](https://github.com/Fuziih/dump1030), which builds o
 Key changes in this fork:
 
 - **C++17 rewrite:** Double-buffered reader thread, Q8 fixed-point ratio checks, and runtime timing tables.
-- **64-state Viterbi DPSK decoder:** Equalizes 4 Mbit/s Mode S P6 uplinks at 2.5 MS/s using a blindly learned receiver impulse response (`--chan`). Includes automatic 56/112-bit length detection (with 112-bit retry on long UF formats) and 2-pass residual frequency/phase refinement.
+- **64-state Viterbi DPSK decoder:** Equalizes 4 Mbit/s Mode S P6 uplinks at the selected input sample rate using a blindly learned receiver impulse response (`--chan`). Includes automatic 56/112-bit length detection (with 112-bit retry on long UF formats) and 2-pass residual frequency/phase refinement.
 - **Target ICAO address recovery:** Recovers the 24-bit aircraft address (`AA`) from the AP field for UF0, UF4, UF5, UF16, UF20, UF21, and UF24.
 - **P6 quality gates & JSONL output:** Filters candidates by envelope coverage, SNR, preamble correlation, SPR lock, Viterbi quality (`Q >= 180`), and UF/length validity. Optional `--p6-diagnostics` logs rejected candidates (`P6_REJECTED`) with the failed gate.
 - **Address repetition tracking:** Marks an address with `*` (and sets `status: "repeated"` in JSONL) once seen at least twice within a 60 s window. First sightings remain `status: "candidate"` with `"aa": null`.
@@ -20,7 +20,7 @@ Key changes in this fork:
 ## Requirements
 
 - Linux
-- RTL-SDR capable of streaming stably at 2.5 MS/s on 1030 MHz
+- RTL-SDR capable of streaming stably at the selected 2.4–30 MS/s sample rate
 - `g++` (C++17) and `librtlsdr-dev`
 - Python 3 (standard library only; needed for `p6sim.py` and helper scripts)
 
@@ -81,8 +81,9 @@ chmod +x dump1030 tools/*.py
 --device <n>            RTL-SDR device index (default: 0)
 --file <path>           Read 8-bit unsigned I/Q samples from file instead of RTL-SDR
 --gain <dB|auto|max>    Tuner gain in dB, "auto", or "max" (default: max)
---samplerate <rate>     Sample rate: 2.4..3.2 MS/s or Hz (default: 2.5). With --file,
-                        must match the recording. --chan requires exactly 2.5 MS/s.
+--samplerate <rate>     Sample rate: 2.4..30 MS/s or Hz (default: 2.5). With --file,
+                        must match the recording. --chan must match the model's
+                        recorded input_sample_rate_hz.
 --ppm <-200..200>       Tuner frequency correction in ppm
 --agc                   Enable RTL2832U digital AGC
 --size <bytes>          Read buffer size in bytes (min: 16384; rounded down to a
@@ -145,7 +146,7 @@ python3 tools/p6_meter.py --device 1 --gain 32 --chan chan.txt
 Reads raw `dump1090`-compatible output and displays 5-second bars for Mode S frames, ICAO counts, repetition, and DF diversity. Press `r` to reset maxima, `q` to quit.
 
 ```bash
-python3 tools/mode-s-meter.py --device 0 --gain 35
+python3 tools/mode-s-meter.py --device 1 --gain 35
 ```
 
 ### `monitor_p6.py` (Live ICAO Monitor)
@@ -165,10 +166,15 @@ Keys: `1` repeated aircraft, `2` II/SI interrogators, `j`/`k` or arrows to navig
 Generates synthetic P6 recordings, runs Viterbi unit tests, and estimates the receiver channel file (`chan.txt`) from raw I/Q captures.
 
 ```bash
-python3 tools/p6sim.py gen -o sim.bin [--count --snr --bw --df --len --filter fir|iir ...]
-python3 tools/p6sim.py selftest [--part a|b|c|d|e] [--filter fir|iir] [--mem 7]
-python3 tools/p6sim.py realtest raw.bin [--out real.log] [--chan-out chan.txt]
+python3 tools/p6sim.py gen -o sim.bin --sample-rate 2400000 [--count --snr ...]
+python3 tools/p6sim.py selftest --sample-rate 2400000 [--part ...] [--mem 7]
+python3 tools/p6sim.py realtest raw.bin --sample-rate 2400000 \
+                        [--out real.log] [--chan-out chan.txt]
 ```
+
+New channel files use `DPSKCHAN2` and record both the input training rate and
+the fixed 20-MS/s model rate. Legacy `DPSKCHAN1` files remain readable and are
+treated as 2.5-MS/s input models.
 
 ### `apx2icao.py` (Offline Log & Parity Analyzer)
 
@@ -181,7 +187,7 @@ python3 tools/apx2icao.py cap1.log [cap2.log ...] [--ref aircraft.json|dir] \
 
 ## Why a Viterbi Decoder?
 
-Mode S uplinks use 4 Mbit/s DPSK (0.25 us per chip). At an RTL-SDR sample rate of 2.5 MS/s, the tuner low-pass filter smears adjacent chips into each other (inter-symbol interference). Simple per-chip phase slicing produces ~20..25% bit errors and almost no error-free frames.
+Mode S uplinks use 4 Mbit/s DPSK (0.25 us per chip). At lower RTL-SDR sample rates, the tuner low-pass filter smears adjacent chips into each other (inter-symbol interference). Simple per-chip phase slicing therefore produces high bit-error rates and very few error-free frames.
 
 `dump1030` solves this with Maximum-Likelihood Sequence Estimation (MLSE):
 
@@ -191,7 +197,7 @@ Mode S uplinks use 4 Mbit/s DPSK (0.25 us per chip). At an RTL-SDR sample rate o
 
 ## Known Limitations
 
-- **USB sample drops:** Some RTL-SDR sticks and USB controllers drop samples at 2.5 MS/s; higher sample rates are not supported with `--chan`.
+- **USB sample drops:** Sample stability still depends on the USB path and receiver. Higher sample rates require a rate-matched `DPSKCHAN2` model and explicit drop validation.
 - **Detector sensitivity:** The real-time C++ pulse detector triggers on fewer weak P6 frames than the offline Python detector in `p6sim.py`.
 - **No independent uplink CRC:** Mode S uplinks XOR the 24-bit ICAO address into the CRC, so any single bit error produces a different valid-looking address. Repetition (`*`) is therefore used as a confidence indicator, not external verification.
 - **Hardware-specific channel file:** Regenerate `chan.txt` whenever you change the SDR stick or gain setting.

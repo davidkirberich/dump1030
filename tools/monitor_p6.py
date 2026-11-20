@@ -40,26 +40,56 @@ class JsonlFollower:
     def __init__(self, pattern: str) -> None:
         self.pattern = pattern
         self.offsets: Dict[str, int] = {}
+        self.inodes: Dict[str, int] = {}
         self.known_files: Set[str] = set()
 
     def read_new(self) -> List[dict]:
         events: List[dict] = []
-        for path in sorted(glob.glob(self.pattern)):
+        current_paths = set(glob.glob(self.pattern))
+
+        # Geloeschte Dateien aus dem Zustand entfernen
+        for stale in list(self.offsets.keys()):
+            if stale not in current_paths:
+                self.offsets.pop(stale, None)
+                self.inodes.pop(stale, None)
+        self.known_files = set(current_paths)
+
+        for path in sorted(current_paths):
             try:
-                with open(path, "r", encoding="utf-8") as stream:
-                    self.known_files.add(path)
-                    offset = self.offsets.get(path, 0)
+                st = os.stat(path)
+            except OSError:
+                self.known_files.discard(path)
+                continue
+
+            inode = st.st_ino
+            offset = self.offsets.get(path, 0)
+            if self.inodes.get(path) != inode or st.st_size < offset:
+                offset = 0
+                self.inodes[path] = inode
+
+            if st.st_size == offset:
+                continue
+
+            try:
+                with open(path, "rb") as stream:
                     stream.seek(offset)
-                    while line := stream.readline():
-                        line_end = stream.tell()
-                        try:
-                            events.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            offset = line_end - len(line)
+                    while raw_line := stream.readline():
+                        if not raw_line.endswith(b"\n"):
+                            # Unvollstaendige Zeile am Dateiende: beim naechsten Poll erneut lesen
                             break
-                        offset = line_end
+                        offset += len(raw_line)
+                        if not raw_line.strip():
+                            continue
+                        try:
+                            text = raw_line.decode("utf-8")
+                            obj = json.loads(text)
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            # Vollstaendige, aber defekte Zeile ueberspringen statt haengenzubleiben
+                            continue
+                        if isinstance(obj, dict):
+                            events.append(obj)
                     self.offsets[path] = offset
-            except FileNotFoundError:
+            except OSError:
                 continue
         return events
 
@@ -74,6 +104,13 @@ def valid_address(address: object) -> bool:
     return value not in (0, 0xFFFFFF)
 
 
+def event_timestamp(event: dict, now_mono: float) -> float:
+    mono = event.get("mono")
+    if isinstance(mono, (int, float)) and 0.0 <= mono <= now_mono + 5.0:
+        return float(mono)
+    return now_mono
+
+
 def update_views(
     events: List[dict],
     sightings: Dict[str, Sighting],
@@ -83,13 +120,14 @@ def update_views(
     confirmed_events = 0
     p6_events = 0
     interrogator_events = 0
-    now = time.time()
+    now_mono = time.monotonic()
     for event in events:
         if event.get("type") != "P6":
             continue
         p6_events += 1
         uf = int(event.get("uf", -1))
         uf_counts[uf] = uf_counts.get(uf, 0) + 1
+        ts = event_timestamp(event, now_mono)
 
         code = event.get("ii")
         kind = "II"
@@ -108,8 +146,8 @@ def update_views(
                     count=1,
                     qmax=quality,
                     q=quality,
-                    first_seen=now,
-                    last_seen=now,
+                    first_seen=ts,
+                    last_seen=ts,
                     ufs={uf},
                     targets=set(),
                     payload=str(event.get("hex", "")),
@@ -119,9 +157,10 @@ def update_views(
                 current_interrogator.count += 1
                 current_interrogator.q = quality
                 current_interrogator.qmax = max(current_interrogator.qmax, quality)
-                current_interrogator.last_seen = now
+                if ts >= current_interrogator.last_seen:
+                    current_interrogator.last_seen = ts
+                    current_interrogator.payload = str(event.get("hex", ""))
                 current_interrogator.ufs.add(uf)
-                current_interrogator.payload = str(event.get("hex", ""))
             address = event.get("aa")
             if valid_address(address):
                 current_interrogator.targets.add(address)
@@ -132,7 +171,7 @@ def update_views(
 
         confirmed_events += 1
         quality = int(event.get("q", 0))
-        reported_count = max(2, int(event.get("aa_cnt", 1)))
+        reported_count = max(1, int(event.get("aa_cnt", 1)))
         current = sightings.get(address)
         if current is None:
             sightings[address] = Sighting(
@@ -140,17 +179,18 @@ def update_views(
                 count=reported_count,
                 q=quality,
                 qmax=quality,
-                uf=int(event.get("uf", -1)),
+                uf=uf,
                 payload=str(event.get("hex", "")),
-                last_seen=now,
+                last_seen=ts,
             )
         else:
-            current.count = max(current.count, reported_count)
+            current.count += 1
             current.q = quality
             current.qmax = max(current.qmax, quality)
-            current.uf = int(event.get("uf", -1))
-            current.payload = str(event.get("hex", ""))
-            current.last_seen = now
+            current.uf = uf
+            if ts >= current.last_seen:
+                current.last_seen = ts
+                current.payload = str(event.get("hex", ""))
     return p6_events, confirmed_events, interrogator_events
 
 
@@ -160,6 +200,13 @@ def age_text(seconds: int) -> str:
     if seconds < 3600:
         return f"{seconds // 60}m{seconds % 60:02d}s"
     return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def safe_curs_set(visibility: int) -> None:
+    try:
+        curses.curs_set(visibility)
+    except curses.error:
+        pass
 
 
 class Monitor:
@@ -230,7 +277,7 @@ class Monitor:
             return
         self.screen.addnstr(y, 0, text.ljust(width - 1), width - 1, attr)
 
-    def render_aircraft(self, visible_rows: int, header_attr: int) -> None:
+    def render_aircraft(self, visible_rows: int, header_attr: int) -> int:
         rows = self.rows()
         self.selection = min(self.selection, max(0, len(rows) - 1))
         if self.selection < self.scroll:
@@ -244,14 +291,14 @@ class Monitor:
             f"{'AGE':>7}  PAYLOAD",
             header_attr,
         )
-        now = time.time()
+        now_mono = time.monotonic()
         for index, sighting in enumerate(
             rows[self.scroll:self.scroll + visible_rows], start=self.scroll
         ):
             line = (
                 f"{sighting.address:<7}{sighting.count:>6}  "
                 f"{sighting.q:>3}  {sighting.qmax:>4}  {sighting.uf:>3}  "
-                f"{age_text(max(0, int(now - sighting.last_seen))):>7}  "
+                f"{age_text(max(0, int(now_mono - sighting.last_seen))):>7}  "
                 f"{sighting.payload}"
             )
             self.add_line(
@@ -266,9 +313,9 @@ class Monitor:
                 self.add_line(
                     4, " P6 received; waiting for a repeated ICAO address"
                 )
-        return
+        return len(rows)
 
-    def render_interrogators(self, visible_rows: int, header_attr: int) -> None:
+    def render_interrogators(self, visible_rows: int, header_attr: int) -> int:
         rows = self.interrogator_rows()
         self.selection = min(self.selection, max(0, len(rows) - 1))
         if self.selection < self.scroll:
@@ -282,7 +329,7 @@ class Monitor:
             f"{'AGE':>7}  TARGETS / LAST PAYLOAD",
             header_attr,
         )
-        now = time.time()
+        now_mono = time.monotonic()
         for index, interrogator in enumerate(
             rows[self.scroll:self.scroll + visible_rows], start=self.scroll
         ):
@@ -292,7 +339,7 @@ class Monitor:
                 f"{interrogator.kind}{interrogator.code:02d}  "
                 f"{interrogator.count:>6}  {interrogator.q:>3}  "
                 f"{interrogator.qmax:>4}  {ufs:<11}"
-                f"{age_text(max(0, int(now - interrogator.last_seen))):>7}  "
+                f"{age_text(max(0, int(now_mono - interrogator.last_seen))):>7}  "
                 f"{targets} / {interrogator.payload}"
             )
             self.add_line(
@@ -309,7 +356,7 @@ class Monitor:
                     f"UF{uf}:{count}" for uf, count in sorted(self.uf_counts.items())
                 )
                 self.add_line(5, f" observed formats: {uf_summary}")
-        return
+        return len(rows)
 
     def render(self) -> None:
         height, width = self.screen.getmaxyx()
@@ -339,11 +386,9 @@ class Monitor:
             title_attr,
         )
         if self.view == 1:
-            self.render_aircraft(visible_rows, header_attr)
-            rows = self.rows()
+            row_count = self.render_aircraft(visible_rows, header_attr)
         else:
-            self.render_interrogators(visible_rows, header_attr)
-            rows = self.interrogator_rows()
+            row_count = self.render_interrogators(visible_rows, header_attr)
 
         footer_y = max(4, height - 3)
         self.add_line(
@@ -354,10 +399,10 @@ class Monitor:
             header_attr,
         )
         self.add_line(height - 2, self.message[:max(0, width - 1)])
-        if rows:
+        if row_count:
             self.add_line(
                 height - 1,
-                f" {self.selection + 1}/{len(rows)}  "
+                f" {self.selection + 1}/{row_count}  "
                 f"(Enter copies no data; select and then freeze for PuTTY copy)"
             )
         self.screen.refresh()
@@ -365,7 +410,7 @@ class Monitor:
     def input_line(self, prompt: str) -> Tuple[bool, str]:
         height, width = self.screen.getmaxyx()
         value = ""
-        curses.curs_set(1)
+        safe_curs_set(1)
         while self.running:
             self.add_line(height - 2, prompt + value)
             self.screen.refresh()
@@ -374,35 +419,37 @@ class Monitor:
             except curses.error:
                 continue
             if key in ("\n", "\r"):
-                curses.curs_set(0)
+                safe_curs_set(0)
                 return True, value
             if key == "\x1b":
-                curses.curs_set(0)
+                safe_curs_set(0)
                 return False, value
             if key in ("\b", "\x7f", curses.KEY_BACKSPACE):
                 value = value[:-1]
             elif isinstance(key, str) and key.isprintable() and len(prompt + value) < width - 2:
                 value += key
-        curses.curs_set(0)
+        safe_curs_set(0)
         return False, value
 
     def export(self, path: str) -> None:
         if self.view == 1:
             target = path or "p6_sightings.tsv"
+            rows = self.rows()
             with open(target, "w", encoding="utf-8") as stream:
                 stream.write("ICAO\tSEEN\tQ\tQMAX\tUF\tPAYLOAD\n")
-                for sighting in self.rows():
+                for sighting in rows:
                     stream.write(
                         f"{sighting.address}\t{sighting.count}\t{sighting.q}\t"
                         f"{sighting.qmax}\t{sighting.uf}\t{sighting.payload}\n"
                     )
-            self.message = f"exported {len(self.rows())} addresses to {target}"
+            self.message = f"exported {len(rows)} addresses to {target}"
             return
 
         target = path or "p6_interrogators.tsv"
+        rows = self.interrogator_rows()
         with open(target, "w", encoding="utf-8") as stream:
             stream.write("ID\tSEEN\tQ\tQMAX\tUFs\tTARGETS\tPAYLOAD\n")
-            for interrogator in self.interrogator_rows():
+            for interrogator in rows:
                 ufs = ",".join(str(uf) for uf in sorted(interrogator.ufs))
                 targets = ",".join(sorted(interrogator.targets))
                 stream.write(
@@ -411,7 +458,7 @@ class Monitor:
                     f"{interrogator.qmax}\t{ufs}\t{targets}\t"
                     f"{interrogator.payload}\n"
                 )
-        self.message = f"exported {len(self.interrogator_rows())} interrogators to {target}"
+        self.message = f"exported {len(rows)} interrogators to {target}"
 
     def command(self) -> None:
         accepted, value = self.input_line(":")
@@ -508,7 +555,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_tui(screen: "curses._CursesWindow", args: argparse.Namespace) -> int:
-    curses.curs_set(0)
+    safe_curs_set(0)
     if curses.has_colors():
         curses.start_color()
         curses.use_default_colors()

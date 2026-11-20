@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
-import math, cmath, random, time
 """p6sim.py - synthetische P6-Uplinks mit bekannten Bits (nur Standardbibliothek)
 
 Erzeugen:
-  p6sim.py gen -o sim.bin [--count 2000] [--snr 25] [--bw 1.0] [--df -6.4]
+  p6sim.py gen -o sim.bin [--sample-rate 2500000] [--count 2000]
+                          [--snr 25] [--bw 1.0] [--df -6.4]
                           [--len 56|112|mix] [--amp 50] [--gap 500]
                           [--drop-ppm 0] [--seed 1]
 Vergleichen:
   p6sim.py compare sim.truth sim.log
 
 Kanal: ideales DPSK @20 MS/s -> FIR-Tiefpass (--bw, MHz einseitig)
-       -> Dezimierung 8:1 auf 2,5 MS/s (zufällige Abtastphase je Frame)
+       -> Abtastung mit der gewaehlten Rate (zufällige Phase je Frame)
        -> Frequenzversatz (--df, kHz) -> Rauschen -> 8-Bit-Quantisierung
        -> optional Sample-Drops (Blöcke à 256 I/Q-Paare)
 """
-import argparse, cmath, collections, math, random, re, sys
+import argparse, cmath, collections, math, random, re, sys, time
 
 FS_HI = 20e6
-DEC = 8
-FS = FS_HI / DEC                                # 2,5 MS/s
+FS = 2.5e6
 DROP_BLK = 256                                  # I/Q-Paare je Drop (≈512 Byte)
+
+
+def model_ticks_per_input_sample(sample_rate):
+    return FS_HI / float(sample_rate)
 
 
 def hi(t_us):                                   # µs -> Index bei 20 MS/s
@@ -64,13 +67,15 @@ def burst(bits, phi0, phi1, phi2):
 
 def gen(a):
     rnd = random.Random(a.seed)
+    sample_rate = a.sample_rate
     h = design_lp(a.bw * 1e6)
-    L, half = len(h), len(h) // 2
+    half = len(h) // 2
     sigma = a.amp / 10 ** (a.snr / 20)          # SNR = Amplitude / sigma je Komponente
-    slot = int(a.gap * 1e-6 * FS)
+    slot = int(round(a.gap * 1e-6 * sample_rate))
     off = slot // 3
-    w = 2 * math.pi * a.df * 1e3 / FS
-    samples = []                                # komplexe Samples @2,5 MS/s
+    w = 2 * math.pi * a.df * 1e3 / sample_rate
+    model_step = model_ticks_per_input_sample(sample_rate)
+    samples = []
     truth = []
     g = 0
     for f in range(a.count):
@@ -78,20 +83,25 @@ def gen(a):
         head = [1, 0, 0, 0, 0] if n == 112 else [0, 0, 0, 0, 0]   # UF16 / UF0
         bits = head + [rnd.getrandbits(1) for _ in range(n - 5)]
         x = burst(bits, *(rnd.uniform(0, 2 * math.pi) for _ in range(3)))
-        frac = rnd.randrange(DEC)
+        frac = rnd.random() * model_step
         y = [complex(rnd.gauss(0, sigma), rnd.gauss(0, sigma)) for _ in range(slot)]
-        for k in range(-(L // DEC) - 2, (len(x) + L) // DEC + 2):
-            t = k * DEC - frac
-            acc = 0j
-            for m in range(L):
-                j = t + half - m
-                if 0 <= j < len(x):
-                    acc += h[m] * x[j]
-            if acc and 0 <= off + k < slot:
-                y[off + k] += a.amp * acc * cmath.exp(1j * w * (g + off + k))
+        wave = [0j] * len(x)
+        for n_hi in range(len(x)):
+            for m, hv in enumerate(h):
+                source = n_hi + half - m
+                if 0 <= source < len(x):
+                    wave[n_hi] += hv * x[source]
+        for k in range(slot):
+            t = (k - off) * model_step - frac
+            i0 = int(math.floor(t))
+            if i0 < 0 or i0 >= len(wave) - 1:
+                continue
+            alpha = t - i0
+            value = wave[i0] * (1.0 - alpha) + wave[i0 + 1] * alpha
+            y[k] += a.amp * value * cmath.exp(1j * w * (g + k))
         samples.extend(y)
         hexs = format(int(''.join(map(str, bits)), 2), '0%dX' % (n // 4))
-        truth.append((g + off + frac / DEC, n, hexs))
+        truth.append((g + off + frac / model_step, n, hexs))
         g += slot
         if f % 200 == 0:
             print(f"  {f}/{a.count}", file=sys.stderr)
@@ -112,10 +122,11 @@ def gen(a):
     tname = re.sub(r'\.bin$', '', a.o) + '.truth'
     with open(tname, 'w') as ft:
         ft.write(f"# snr={a.snr} bw={a.bw} df={a.df} amp={a.amp} "
-                 f"drop_ppm={a.drop_ppm} seed={a.seed} fs={FS}\n")
+                 f"drop_ppm={a.drop_ppm} seed={a.seed} fs={sample_rate}\n")
         for idx, n, hx in truth:
             ft.write(f"{idx:.3f} {n} {hx}\n")
-    print(f"{a.o}: {g / FS:.2f} s, {a.count} Frames, {dropped} Drop-Blöcke; "
+    print(f"{a.o}: {g / sample_rate:.2f} s, "
+          f"{a.count} Frames, {dropped} Drop-Blöcke; "
           f"Wahrheit in {tname}")
     if dropped:
         print("  Hinweis: Indizes in .truth sind nicht um Drops korrigiert "
@@ -336,12 +347,14 @@ def st_bits2chips(bits):
         chips.append(c)
     return chips
 
-def st_frame_samples(model, chips, off, A, phi, snr, rng):
-    """Empfangssamples bei 2,5 MS/s: t_k = off + 8k (20-MS/s-Index). df = 0."""
+def st_frame_samples(model, chips, off, A, phi, snr, rng,
+                     sample_rate=FS):
+    """Empfangssamples mit fester physikalischer Zeit auf dem 20-MS/s-Modell."""
     lo, hi = model.support()
     rot = A * cmath.exp(1j * phi)
     sig = 1.0 / snr
     out, t = [], off
+    step = model_ticks_per_input_sample(sample_rate)
     while t < model.ltot - 1:
         v = model.knv(t)
         j0 = max(0, math.ceil((t - hi) / 5))
@@ -349,13 +362,13 @@ def st_frame_samples(model, chips, off, A, phi, snr, rng):
         for j in range(j0, j1 + 1):
             v += chips[j] * model.g(j, t)
         out.append(rot * v + complex(rng.gauss(0, sig), rng.gauss(0, sig)))
-        t += 8
+        t += step
     return out
 
-def st_old(r, off, delay, anchor, n):
+def st_old(r, off, delay, anchor, n, model_step=8.0):
     """alte Einzelentscheidung: Catmull-Rom in Chipmitten, Vorzeichen von Re(z_b * conj(z_b-1))"""
     def at(t):
-        u = (t - off) / 8
+        u = (t - off) / model_step
         i = math.floor(u)
         a = u - i
         if i < 1 or i + 2 >= len(r):
@@ -371,12 +384,12 @@ def st_old(r, off, delay, anchor, n):
         prev = cur
     return bits
 
-def st_prepare(rx, r, off, phi, A, L, N):
+def st_prepare(rx, r, off, phi, A, L, N, model_step=8.0):
     """pro Sample: (Schritt, Fensteranfang w, kn, [B_w..B_w+L-1], derotiertes z)"""
     der = cmath.exp(-1j * phi) / A
     out = []
     for k, s in enumerate(r):
-        t = off + 8 * k
+        t = off + model_step * k
         jc = math.floor((t - rx.delay - rx.anchor) / 5)
         w = jc - (L - 1) // 2
         e = w + L - 1
@@ -422,25 +435,34 @@ def st_viterbi(samples, L, n, N, retm=False):
         prev = chips[j]
     return (bits, best[0]) if retm else bits
 
-def st_eval(tx, rx, n, Ls, count, snr, dt, dphi, seed, old=True):
+def st_eval(tx, rx, n, Ls, count, snr, dt, dphi, seed, old=True,
+            sample_rate=FS):
     """dt: Timingfehler des Empfängers in 20-MS/s-Samples (1 = 0,05 µs), dphi in Grad"""
     rng = random.Random(seed)
     res = {}
     keys = (['old'] if old else []) + list(Ls)
+    model_step = model_ticks_per_input_sample(sample_rate)
     for k in keys:
         res[k] = [0, 0]                       # Bitfehler, fehlerfreie Frames
     N = n + 2
     for _ in range(count):
         bits = [rng.randint(0, 1) for _ in range(n)]
         chips = st_bits2chips(bits)
-        off = rng.uniform(0, 8)
+        off = rng.uniform(0, model_step)
         phi = rng.uniform(-math.pi, math.pi)
-        r = st_frame_samples(tx, chips, off, 1.0, phi, snr, rng)
+        r = st_frame_samples(
+            tx, chips, off, 1.0, phi, snr, rng, sample_rate
+        )
         decs = {}
         if old:
-            decs['old'] = st_old(r, off + dt, rx.delay, rx.anchor, n)
+            decs['old'] = st_old(
+                r, off + dt, rx.delay, rx.anchor, n, model_step
+            )
         for L in Ls:
-            smp = st_prepare(rx, r, off + dt, phi + math.radians(dphi), 1.0, L, N)
+            smp = st_prepare(
+                rx, r, off + dt, phi + math.radians(dphi),
+                1.0, L, N, model_step
+            )
             decs[L] = st_viterbi(smp, L, n, N)
         for k, d in decs.items():
             e = sum(1 for a, b in zip(bits, d) if a != b)
@@ -464,14 +486,20 @@ def cmd_selftest(args):
 
     if 'a' in parts:
         print('\n[1a] ideal (Filter, frac, Phase, Amplitude bekannt, df=0)')
-        res = st_eval(tx, tx, n, [args.mem], cnt, snr, 0.0, 0.0, args.seed)
+        res = st_eval(
+            tx, tx, n, [args.mem], cnt, snr, 0.0, 0.0, args.seed,
+            sample_rate=args.sample_rate
+        )
         st_print('ideal', res, cnt, n)
         ok = 100.0 * res[args.mem][1] / cnt
         print('  -> %s (Kriterium: >= 90 %% fehlerfrei)' % ('BESTANDEN' if ok >= 90 else 'NICHT bestanden'))
 
     if 'b' in parts:
         print('\n[1b] Gedächtnis (ideal)')
-        res = st_eval(tx, tx, n, [3, 4, 5, 6, 7], cnt, snr, 0.0, 0.0, args.seed, old=False)
+        res = st_eval(
+            tx, tx, n, [3, 4, 5, 6, 7], cnt, snr, 0.0, 0.0,
+            args.seed, old=False, sample_rate=args.sample_rate
+        )
         st_print('ideal', res, cnt, n)
 
     if 'c' in parts:
@@ -483,27 +511,42 @@ def cmd_selftest(args):
                  ('phase -10 deg', 1.0, 0.0, -10.0), ('phase +10 deg', 1.0, 0.0, 10.0)]
         for label, fb, dt, dp in cases:
             rx = st_model(args.filter, args.bw * fb)
-            res = st_eval(tx, rx, n, [args.mem], cnt, snr, dt, dp, args.seed, old=(fb != 1.0))
+            res = st_eval(
+                tx, rx, n, [args.mem], cnt, snr, dt, dp, args.seed,
+                old=(fb != 1.0), sample_rate=args.sample_rate
+            )
             st_print(label, res, cnt, n)
     if 'd' in parts:
         print('\n[2a] Kanal geschaetzt aus %d Trainingsframes (Bits, frac, Phase bekannt)' % args.train)
-        h = st_estimate_channel(tx, args.train, n, snr, args.seed + 1000)
+        h = st_estimate_channel(
+            tx, args.train, n, snr, args.seed + 1000, args.sample_rate
+        )
         ht = st_true_h(tx)
         err = math.sqrt(sum((a - b) ** 2 for a, b in zip(h, ht)) / sum(b * b for b in ht))
         print('  rel. Kanalfehler %.4f   delay geschaetzt %.2f Samples' % (err, sum((i + ST_LMIN) * v for i, v in enumerate(h)) / sum(h)))
         rx = st_model_from_h(tx, h)
-        res = st_eval(tx, rx, n, [args.mem], cnt, snr, 0.0, 0.0, args.seed, old=False)
+        res = st_eval(
+            tx, rx, n, [args.mem], cnt, snr, 0.0, 0.0, args.seed,
+            old=False, sample_rate=args.sample_rate
+        )
         st_print('geschaetzt', res, cnt, n)
     if 'e' in parts:
         print('\n[2b] Blindtest (Bits, frac, Phase, Amplitude, Kanal unbekannt), Start %s bw=%.2f'
               % (args.start, args.start_bw))
         rng = random.Random(args.seed + 2000)
+        model_step = model_ticks_per_input_sample(args.sample_rate)
         frames = []
         for _ in range(max(cnt, args.train)):
             bits = [rng.randint(0, 1) for _ in range(n)]
-            off = rng.uniform(0, 8)
+            off = rng.uniform(0, model_step)
             phi = rng.uniform(-math.pi, math.pi)
-            frames.append((bits, st_frame_samples(tx, st_bits2chips(bits), off, 1.0, phi, snr, rng)))
+            frames.append((
+                bits,
+                st_frame_samples(
+                    tx, st_bits2chips(bits), off, 1.0, phi, snr, rng,
+                    args.sample_rate
+                )
+            ))
         rx = st_model(args.start, args.start_bw)
         N = n + 2
         for rnd in range(args.rounds + 1):
@@ -511,15 +554,26 @@ def cmd_selftest(args):
             use = frames if last else frames[:args.train]
             dec, be, ok = [], 0, 0
             for bits, r in use:
-                m, d, c, phi, A = st_blind_decode(rx, r, n, N, args.mem)
+                decoded = st_blind_decode(
+                    rx, r, n, N, args.mem, args.sample_rate
+                )
+                if decoded is None:
+                    be += n
+                    continue
+                m, d, c, phi, A = decoded
                 e = sum(1 for a, b in zip(bits, d) if a != b)
                 be += e
                 ok += (e == 0)
                 dec.append((r, c, phi, A, st_bits2chips(d)))
             print('  Runde %d  %4d Frames  BER %7.3f %%  fehlerfrei %6.1f %%'
                   % (rnd, len(use), 100.0 * be / (len(use) * n), 100.0 * ok / len(use)))
-            if not last:
-                rx = st_model_from_h(tx, st_ls_frames(rx.ltot, rx.anchor, dec))
+            if not last and dec:
+                rx = st_model_from_h(
+                    tx,
+                    st_ls_frames(
+                        rx.ltot, rx.anchor, dec, args.sample_rate
+                    )
+                )
     print('\nLaufzeit %.1f s' % (time.time() - t0))
 ST_LMIN, ST_LMAX = -20, 59      # Kanal-Taps bei 20 MS/s: -1,0 .. +2,95 µs
 
@@ -552,23 +606,26 @@ def st_solve(M, v):
         h[c] = (A[c][n] - sum(A[c][k] * h[k] for k in range(c + 1, n))) / A[c][c]
     return h
 
-def st_estimate_channel(tx, ntrain, n, snr, seed):
+def st_estimate_channel(tx, ntrain, n, snr, seed, sample_rate=FS):
     """LS-Schätzung der reellen Kanalantwort h[l] aus ntrain Frames"""
     rng = random.Random(seed)
     L = ST_LMAX - ST_LMIN + 1
     M = [[0.0] * L for _ in range(L)]
     v = [0.0] * L
+    model_step = model_ticks_per_input_sample(sample_rate)
     for _ in range(ntrain):
         bits = [rng.randint(0, 1) for _ in range(n)]
         chips = st_bits2chips(bits)
-        off = rng.uniform(0, 8)
+        off = rng.uniform(0, model_step)
         phi = rng.uniform(-math.pi, math.pi)
-        r = st_frame_samples(tx, chips, off, 1.0, phi, snr, rng)
+        r = st_frame_samples(
+            tx, chips, off, 1.0, phi, snr, rng, sample_rate
+        )
         x = st_input(tx.ltot, tx.anchor, chips)
         nx = len(x)
         der = cmath.exp(-1j * phi)
         for k, s in enumerate(r):
-            t = off + 8 * k
+            t = off + model_step * k
             i = int(t)
             a = t - i
             reg = []
@@ -623,12 +680,12 @@ def st_model_from_h(tx, h):
     rx.delay = sum((idx + ST_LMIN) * hv for idx, hv in enumerate(h)) / sum(h)
     return rx
 
-def st_pre_fit(rx, r, c):
+def st_pre_fit(rx, r, c, model_step):
     """Präambel-Fit bei Hypothese c: liefert (num, den) oder None"""
     lim = rx.anchor + rx.delay - 10          # bis 0,5 µs vor den Daten
     num, den = 0j, 0.0
     for k, s in enumerate(r):
-        t = c + 8 * k
+        t = c + model_step * k
         if t >= lim:
             break
         kv = rx.knv(t)
@@ -636,37 +693,42 @@ def st_pre_fit(rx, r, c):
         den += kv * kv
     return (num, den) if den > 0 else None
 
-def st_blind_decode(rx, r, n, N, L):
+def st_blind_decode(rx, r, n, N, L, sample_rate=FS, frame_origin=0.0):
     best_c, best_s = None, -1.0
+    model_step = model_ticks_per_input_sample(sample_rate)
     for c in range(-24, 33):                 # Grobtiming in 0,05-µs-Schritten
-        f = st_pre_fit(rx, r, c)
+        f = st_pre_fit(rx, r, frame_origin + c, model_step)
         if f and abs(f[0]) ** 2 / f[1] > best_s:
             best_c, best_s = c, abs(f[0]) ** 2 / f[1]
+    if best_c is None:
+        return None
     out = None
     for cc in (best_c - 1, best_c, best_c + 1):
-        f = st_pre_fit(rx, r, cc)
+        off = frame_origin + cc
+        f = st_pre_fit(rx, r, off, model_step)
         if not f:
             continue
         num, den = f
         phi, A = cmath.phase(num), abs(num) / den
-        smp = st_prepare(rx, r, cc, phi, A, L, N)
+        smp = st_prepare(rx, r, off, phi, A, L, N, model_step)
         bits, m = st_viterbi(smp, L, n, N, retm=True)
         m /= max(1, len(smp))
         if out is None or m < out[0]:
-            out = (m, bits, cc, phi, A)
+            out = (m, bits, off, phi, A)
     return out
 
-def st_ls_frames(ltot, anchor, frames):
+def st_ls_frames(ltot, anchor, frames, sample_rate=FS):
     """LS-Kanal aus entschiedenen Frames: (r, off, phi, A, chips)"""
     L = ST_LMAX - ST_LMIN + 1
     M = [[0.0] * L for _ in range(L)]
     v = [0.0] * L
+    model_step = model_ticks_per_input_sample(sample_rate)
     for r, off, phi, A, chips in frames:
         x = st_input(ltot, anchor, chips)
         nx = len(x)
         der = cmath.exp(-1j * phi) / A
         for k, s in enumerate(r):
-            t = off + 8 * k
+            t = off + model_step * k
             i = math.floor(t)
             a = t - i
             reg = []
@@ -693,44 +755,85 @@ def st_ls_frames(ltot, anchor, frames):
     return st_solve(M, v)
 
 # ===================== REALTEST (Stufe 3) =====================
-def rt_detect(data, nmax, thr_fac):
+def rt_window_params(sample_rate):
+    prefix = int(math.ceil(8.0 * sample_rate / 1e6))
+    window = int(math.ceil(50.0 * sample_rate / 1e6)) + 1
+    return prefix, window
+
+def rt_detect(data, nmax, thr_fac, sample_rate):
     """P1/P2/P6-Detektor auf uint8-I/Q, liefert (Liste der P1-Samples, Schwelle)"""
     sq = [(i - 127.5) ** 2 for i in range(256)]
     ns = min(len(data) // 2, nmax)
     probe = sorted(sq[data[2 * j]] + sq[data[2 * j + 1]] for j in range(0, min(ns, 1000000), 97))
     thr = probe[len(probe) // 2] * thr_fac
+    def samples(us):
+        return max(1, int(round(us * sample_rate / 1e6)))
+
+    p1_in = samples(0.4)
+    p1_pause1 = samples(1.2)
+    p1_pause2 = min(samples(2.0) - 1, samples(1.6))
+    p2 = samples(2.0)
+    p2_in = samples(2.4)
+    p2_tail = samples(3.2)
+    p6_start = samples(4.0)
+    p6_stop = samples(7.6)
+    skip = samples(34.0)
+    guard = samples(40.0)
     hits, CH, k0, nxt = [], 1000000, 0, 0
-    while k0 < ns - 100:
-        k1 = min(ns, k0 + CH + 100)
+    while k0 < ns - guard:
+        k1 = min(ns, k0 + CH + guard)
         m = [sq[data[2 * j]] + sq[data[2 * j + 1]] for j in range(k0, k1)]
-        for i in range(1, len(m) - 90):
+        for i in range(p1_in, len(m) - p6_stop - 1):
             if m[i] <= thr or k0 + i < nxt:
                 continue
             p = m[i]
-            if (m[i - 1] < thr and m[i + 1] > thr and m[i + 3] < p / 4 and m[i + 4] < p / 4
-                    and m[i + 5] > thr and m[i + 6] > thr and m[i + 8] < p / 4
-                    and all(m[i + q] > thr / 2 for q in range(10, 20))):
+            if (m[i - p1_in] < thr and m[i + p1_in] > thr
+                    and m[i + p1_pause1] < p / 4
+                    and m[i + p1_pause2] < p / 4
+                    and m[i + p2] > thr and m[i + p2_in] > thr
+                    and m[i + p2_tail] < p / 4
+                    and all(
+                        m[i + q] > thr / 2
+                        for q in range(p6_start, p6_stop + 1)
+                    )):
                 hits.append(k0 + i)
-                nxt = k0 + i + 85          # 34 µs Totzeit
+                nxt = k0 + i + skip
         k0 += CH
-        print('  scan %5.1f s  %d Kandidaten' % (k0 / 2.5e6, len(hits)), end='\r')
+        print(
+            '  scan %5.1f s  %d Kandidaten' % (k0 / sample_rate, len(hits)),
+            end='\r'
+        )
     print()
     return hits, thr
 
-def rt_frame(data, k, thr):
+def rt_frame(data, k, thr, sample_rate):
     """Fenster ab 8 µs vor P1, Länge per Energie bei 23-27 µs, df per Frame"""
-    s0 = k - 20
-    r = [complex(data[2 * j] - 127.5, data[2 * j + 1] - 127.5) for j in range(s0, s0 + 125)]
-    e = sum(abs(r[20 + q]) ** 2 for q in range(57, 68)) / 11
+    prefix, window = rt_window_params(sample_rate)
+    s0 = k - prefix
+    r = [
+        complex(data[2 * j] - 127.5, data[2 * j + 1] - 127.5)
+        for j in range(s0, s0 + window)
+    ]
+    energy_start = prefix + int(round(23.0 * sample_rate / 1e6))
+    energy_stop = min(len(r), prefix + int(round(27.0 * sample_rate / 1e6)) + 1)
+    e = sum(
+        abs(value) ** 2 for value in r[energy_start:energy_stop]
+    ) / max(1, energy_stop - energy_start)
     n = 112 if e > thr else 56
-    end = 20 + (49 if n == 56 else 84)
+    df_lag = max(1, int(round(0.4 * sample_rate / 1e6)))
+    df_start = max(df_lag, prefix + int(round(3.6 * sample_rate / 1e6)))
+    data_end_us = 19.75 if n == 56 else 33.75
+    end = min(
+        len(r),
+        prefix + int(round(data_end_us * sample_rate / 1e6))
+    )
     acc = 0j
-    for j in range(20 + 9, end):
-        d = r[j] * r[j - 1].conjugate()
+    for j in range(df_start, end):
+        d = r[j] * r[j - df_lag].conjugate()
         acc += d * d
-    w = cmath.phase(acc) / 2 if acc != 0 else 0.0
+    w = cmath.phase(acc) / (2.0 * df_lag) if acc != 0 else 0.0
     r = [z * cmath.exp(-1j * w * j) for j, z in enumerate(r)]
-    return r, n, w * 2.5e6 / (2 * math.pi)
+    return r, n, w * sample_rate / (2 * math.pi)
 
 def rt_stats(label, rows):
     aps = [b[-24:] for b in rows]
@@ -755,14 +858,21 @@ def rt_stats(label, rows):
 
 def cmd_realtest(args):
     t0 = time.time()
-    data = open(args.file, 'rb').read()
+    with open(args.file, 'rb') as fi:
+        data = fi.read()
     if not data:
         raise SystemExit('Keine IQ-Daten in der Eingabedatei; Abbruch.')
-    hits, thr = rt_detect(data, int(args.max_sec * 2.5e6), args.thr)
+    sample_rate = args.sample_rate
+    hits, thr = rt_detect(
+        data, int(args.max_sec * sample_rate), args.thr, sample_rate
+    )
     frames = []
+    prefix, window = rt_window_params(sample_rate)
+    frame_origin = ST_PAD - prefix * model_ticks_per_input_sample(sample_rate)
     for k in hits:
-        if k >= 20 and 2 * (k + 110) <= len(data):
-            r, n, df = rt_frame(data, k, thr)
+        s0 = k - prefix
+        if s0 >= 0 and 2 * (s0 + window) <= len(data):
+            r, n, df = rt_frame(data, k, thr, sample_rate)
             frames.append((k, r, n, df))
     dfs = sorted(f[3] for f in frames)
     print('Frames %d (112 Bit: %d)  df-Median %.2f kHz'
@@ -776,21 +886,43 @@ def cmd_realtest(args):
     for rnd in range(args.rounds):
         dec = []
         for k, r, n, df in frames[:args.train]:
-            m, d, c, phi, A = st_blind_decode(rx, r, n, n + 2, L)
+            decoded = st_blind_decode(
+                rx, r, n, n + 2, L, sample_rate, frame_origin
+            )
+            if decoded is None:
+                continue
+            m, d, c, phi, A = decoded
             dec.append((m, (r, c, phi, A, st_bits2chips(d))))
+        if not dec:
+            raise SystemExit('Keine decodierbaren Trainingsframes; Abbruch.')
         dec.sort(key=lambda x: x[0])
         good = [x[1] for x in dec[:max(10, len(dec) // 2)]]
         print('  Kanalrunde %d: Metrik-Median %.4f' % (rnd, dec[len(dec) // 2][0]))
-        rx = st_model_from_h(rx, st_ls_frames(rx.ltot, rx.anchor, good))
+        rx = st_model_from_h(
+            rx, st_ls_frames(
+                rx.ltot, rx.anchor, good, sample_rate
+            )
+        )
     if args.chan_out:
         with open(args.chan_out, 'w') as fo:
-            fo.write('DPSKCHAN1 %d %.6f %d %d\n' % (rx.anchor, rx.delay, len(rx.g0), len(rx.kn)))
+            fo.write(
+                'DPSKCHAN2 %d %d %d %.6f %d %d\n' %
+                (
+                    int(round(sample_rate)), int(FS_HI), rx.anchor, rx.delay,
+                    len(rx.g0), len(rx.kn)
+                )
+            )
             fo.write(' '.join('%.7g' % v for v in rx.g0) + '\n')
             fo.write(' '.join('%.7g' % v for v in rx.kn) + '\n')
         print('  Kanal geschrieben: %s (delay %.2f Samples)' % (args.chan_out, rx.delay))
     res = []
     for i, (k, r, n, df) in enumerate(frames):
-        m, d, c, phi, A = st_blind_decode(rx, r, n, n + 2, L)
+        decoded = st_blind_decode(
+            rx, r, n, n + 2, L, sample_rate, frame_origin
+        )
+        if decoded is None:
+            continue
+        m, d, c, phi, A = decoded
         res.append((k, n, d, m))
         if i % 50 == 0:
             print('  decodiert %d/%d' % (i, len(frames)), end='\r')
@@ -798,7 +930,13 @@ def cmd_realtest(args):
     if args.out:
         with open(args.out, 'w') as fo:
             for k, n, d, m in res:
-                fo.write('%.1f %d %0*X %.4f\n' % (k / 2.5, n, n // 4, int(''.join(map(str, d)), 2), m))
+                fo.write(
+                    '%.1f %d %0*X %.4f\n' %
+                    (
+                        k * 1e6 / sample_rate, n, n // 4,
+                        int(''.join(map(str, d)), 2), m
+                    )
+                )
     uf = {}
     for k, n, d, m in res:
         u = int(''.join(map(str, d[:5])), 2)
@@ -826,6 +964,7 @@ g.add_argument('--df', type=float, default=-6.4, help="Frequenzversatz in kHz")
 g.add_argument('--len', choices=('56', '112', 'mix'), default='mix')
 g.add_argument('--amp', type=float, default=50.0, help="Signalamplitude (ADC-Einheiten)")
 g.add_argument('--gap', type=float, default=500.0, help="Abstand der Frames in µs")
+g.add_argument('--sample-rate', type=float, default=FS)
 g.add_argument('--drop-ppm', type=float, default=0.0,
                help="Sample-Drops (z.B. 1850 wie gemessen)")
 g.add_argument('--seed', type=int, default=1)
@@ -838,6 +977,7 @@ p_st = sub.add_parser('selftest', help="MLSE/Viterbi-Machbarkeitstest")
 p_st.add_argument('--filter', choices=['fir', 'iir'], default='fir')
 p_st.add_argument('--bw', type=float, default=1.0)
 p_st.add_argument('--snr', type=float, default=25.0)
+p_st.add_argument('--sample-rate', type=float, default=FS)
 p_st.add_argument('--nbits', type=int, choices=[56, 112], default=56)
 p_st.add_argument('--count', type=int, default=200)
 p_st.add_argument('--mem', type=int, default=4)
@@ -851,6 +991,7 @@ p_st.add_argument('--rounds', type=int, default=3)
 p_rt = sub.add_parser('realtest', help="Echte IQ-Datei dekodieren")
 p_rt.add_argument('file')
 p_rt.add_argument('--max-sec', type=float, default=30.0)
+p_rt.add_argument('--sample-rate', type=float, default=FS)
 p_rt.add_argument('--thr', type=float, default=10.0)
 p_rt.add_argument('--train', type=int, default=150)
 p_rt.add_argument('--rounds', type=int, default=3)
@@ -861,4 +1002,6 @@ p_rt.add_argument('--out', default='')
 p_rt.add_argument('--chan-out', default='')
 
 args = ap.parse_args()
+if hasattr(args, 'sample_rate') and args.sample_rate <= 0:
+    ap.error('--sample-rate must be positive')
 cmd_realtest(args) if args.cmd == 'realtest' else (cmd_selftest(args) if args.cmd == 'selftest' else (gen(args) if args.cmd == 'gen' else compare(args)))
