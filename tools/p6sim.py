@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""p6sim.py - synthetische P6-Uplinks mit bekannten Bits (nur Standardbibliothek)
+"""p6sim.py - synthetische P6-Uplinks mit bekannten Bits
 
 Erzeugen:
   p6sim.py gen -o sim.bin [--sample-rate 2500000] [--format cu8|sc16]
@@ -9,24 +9,31 @@ Erzeugen:
                           [--drop-ppm 0] [--seed 1]
 Vergleichen:
   p6sim.py compare sim.truth sim.log
-
-Kanal: ideales DPSK @20 MS/s -> FIR-Tiefpass (--bw, MHz einseitig)
-       -> Abtastung mit der gewaehlten Rate (zufällige Phase je Frame)
-       -> Frequenzversatz (--df, kHz) -> Rauschen -> 8-Bit-Quantisierung
-       -> optional Sample-Drops (Blöcke à 256 I/Q-Paare)
 """
-import argparse, cmath, collections, math, random, re, struct, sys, time
+import argparse
+import cmath
+import collections
+from concurrent.futures import ProcessPoolExecutor
+import math
+import os
+import random
+import re
+import struct
+import sys
+import time
+
+import numpy as np
 
 FS_HI = 20e6
 FS = 2.5e6
-DROP_BLK = 256                                  # I/Q-Paare je Drop (≈512 Byte)
+DROP_BLK = 256                                  # I/Q-Paare je Drop (~512 Byte)
 
 
 def model_ticks_per_input_sample(sample_rate):
     return FS_HI / float(sample_rate)
 
 
-def hi(t_us):                                   # µs -> Index bei 20 MS/s
+def hi(t_us):                                   # us -> Index bei 20 MS/s
     return int(round(t_us * FS_HI / 1e6))
 
 
@@ -45,10 +52,8 @@ def design_lp(fc_hz, ntaps=129):                # gefenstertes Sinc, Hamming
 
 
 def burst(bits, phi0, phi1, phi2):
-    """Komplexe Hüllkurve bei 20 MS/s, Index 0 = Vorderflanke P1.
-    P1 0..0,8 µs, P2 2,0..2,8 µs, P6 ab 3,5 µs, SPR 1,25 µs nach P6-Beginn,
-    Bit b: Phasenumkehr (=1) bei SPR + 0,5 + b*0,25 µs."""
-    p6_len = 1.25 + 0.5 + len(bits) * 0.25 + 0.5          # 16,25 / 30,25 µs
+    """Komplexe Huellkurve bei 20 MS/s, Index 0 = Vorderflanke P1."""
+    p6_len = 1.25 + 0.5 + len(bits) * 0.25 + 0.5
     x = [0j] * hi(3.5 + p6_len)
     for n in range(hi(0.0), hi(0.8)):
         x[n] = cmath.exp(1j * phi1)
@@ -71,7 +76,7 @@ def gen(a):
     sample_rate = a.sample_rate
     h = design_lp(a.bw * 1e6)
     half = len(h) // 2
-    sigma = a.amp / 10 ** (a.snr / 20)          # SNR = Amplitude / sigma je Komponente
+    sigma = a.amp / 10 ** (a.snr / 20)
     slot = int(round(a.gap * 1e-6 * sample_rate))
     off = slot // 3
     w = 2 * math.pi * a.df * 1e3 / sample_rate
@@ -81,7 +86,7 @@ def gen(a):
     g = 0
     for f in range(a.count):
         n = 112 if (a.len == '112' or (a.len == 'mix' and rnd.random() < 0.1)) else 56
-        head = [1, 0, 0, 0, 0] if n == 112 else [0, 0, 0, 0, 0]   # UF16 / UF0
+        head = [1, 0, 0, 0, 0] if n == 112 else [0, 0, 0, 0, 0]
         bits = head + [rnd.getrandbits(1) for _ in range(n - 5)]
         x = burst(bits, *(rnd.uniform(0, 2 * math.pi) for _ in range(3)))
         frac = rnd.random() * model_step
@@ -136,11 +141,11 @@ def gen(a):
         for idx, n, hx in truth:
             ft.write(f"{idx:.3f} {n} {hx}\n")
     print(f"{a.o}: {g / sample_rate:.2f} s, "
-          f"{a.count} Frames, {dropped} Drop-Blöcke; "
+          f"{a.count} Frames, {dropped} Drop-Bloecke; "
           f"Wahrheit in {tname}")
     if dropped:
         print("  Hinweis: Indizes in .truth sind nicht um Drops korrigiert "
-              "(compare ordnet über Reihenfolge + Bits zu).")
+              "(compare ordnet ueber Reihenfolge + Bits zu).")
 
 
 def tobits(hx):
@@ -219,7 +224,7 @@ def compare(a):
 
     print(f"Fehlerfreie Frames: {okf} ({okf / len(matched) * 100:.1f} %)")
     print(f"Bitfehlerrate: {nerr / nbit * 100:.2f} %")
-    print("Fehlerrate nach Muster (Vorgänger->Bit, Wahrheit):")
+    print("Fehlerrate nach Muster (Vorgaenger->Bit, Wahrheit):")
     for key in ('0->0', '0->1', '1->0', '1->1'):
         n, e = patt[key]
         if n:
@@ -231,7 +236,7 @@ def compare(a):
 
     t56 = [tobits(T[k][2]) for k, db in matched if len(db) == 56]
     d56 = [db for k, db in matched if len(db) == 56]
-    print("AP-Feld (56 Bit)          Gewicht   11-Anteil  Lauflänge 1")
+    print("AP-Feld (56 Bit)          Gewicht   11-Anteil  Lauflaenge 1")
     for name, (w, p11, r1) in (("Wahrheit", apstat(t56)),
                                ("dump1030 auf Sim.", apstat(d56)),
                                ("echte Aufnahme", (5.81, 3.1, 87.4))):
@@ -239,15 +244,14 @@ def compare(a):
 
 
 # ===================== SELFTEST (Stufe 1) =====================
-# Eigenständig: eigenes 20-MS/s-Modell, nutzt keine gen-Funktionen.
-# Zeitachse: P1-Vorderflanke = 0, P6 ab 3,5 µs, SPR 4,75 µs,
-# Datenchip j beginnt bei 5,25 + 0,25*j µs, Guard 2 Chips (0,5 µs).
-ST_PAD    = 160      # 8 µs Rand bei 20 MS/s
-ST_ANCHOR = ST_PAD + 105   # 5,25 µs
-ST_NBMAX  = 112
+ST_PAD = 160
+ST_ANCHOR = ST_PAD + 105
+ST_NBMAX = 112
+ST_LMIN, ST_LMAX = -20, 59
+
 
 def st_design_fir(bw, fs=20.0, ntaps=129):
-    fc = bw / fs                      # bw = einseitige Grenzfrequenz in MHz
+    fc = bw / fs
     mid = (ntaps - 1) / 2
     h = []
     for i in range(ntaps):
@@ -257,23 +261,25 @@ def st_design_fir(bw, fs=20.0, ntaps=129):
     g = sum(h)
     return [v / g for v in h]
 
+
 def st_design_butter6(bw, fs=20.0):
     N = 6
-    wc = 2 * fs * math.tan(math.pi * bw / fs)      # Prewarping
+    wc = 2 * fs * math.tan(math.pi * bw / fs)
     secs = []
     for k in range(N // 2):
         p = wc * cmath.exp(1j * math.pi * (2 * k + 1 + N) / (2 * N))
-        z = (1 + p / (2 * fs)) / (1 - p / (2 * fs))  # bilinear
+        z = (1 + p / (2 * fs)) / (1 - p / (2 * fs))
         a1, a2 = -2 * z.real, abs(z) ** 2
-        g = (1 + a1 + a2) / 4                         # DC-Verstärkung 1
+        g = (1 + a1 + a2) / 4
         secs.append((g, 2 * g, g, a1, a2))
     return secs
 
+
 def st_make_filter(kind, bw):
-    """liefert (f, delay): f filtert reelle Liste bei 20 MS/s, delay in Samples"""
     if kind == 'fir':
         h = st_design_fir(bw)
         mid = (len(h) - 1) // 2
+
         def f(x):
             n = len(x)
             nz = [(k, v) for k, v in enumerate(x) if v != 0.0]
@@ -286,6 +292,7 @@ def st_make_filter(kind, bw):
             return y
         return f, 0.0
     secs = st_design_butter6(bw)
+
     def f(x):
         y = list(x)
         for b0, b1, b2, a1, a2 in secs:
@@ -302,6 +309,7 @@ def st_make_filter(kind, bw):
     delay = sum(i * v for i, v in enumerate(imp)) / sum(imp)
     return f, delay
 
+
 class StModel:
     def __init__(self, kind, bw):
         self.kind, self.bw = kind, bw
@@ -311,28 +319,31 @@ class StModel:
         x = [0.0] * self.ltot
         for i in range(self.anchor, self.anchor + 5):
             x[i] = 1.0
-        self.g0 = f(x)                                # Antwort auf Einheitschip j=0
+        self.g0 = f(x)
         x = [0.0] * self.ltot
-        for i in range(ST_PAD, ST_PAD + 16):        x[i] = 1.0   # P1
-        for i in range(ST_PAD + 40, ST_PAD + 56):   x[i] = 1.0   # P2
-        for i in range(self.anchor - 35, self.anchor - 10): x[i] = 1.0   # P6 vor SPR
-        for i in range(self.anchor - 10, self.anchor):      x[i] = -1.0  # SPR..Bit0
-        self.kn = f(x)                                # bekannter Anteil
+        for i in range(ST_PAD, ST_PAD + 16):
+            x[i] = 1.0
+        for i in range(ST_PAD + 40, ST_PAD + 56):
+            x[i] = 1.0
+        for i in range(self.anchor - 35, self.anchor - 10):
+            x[i] = 1.0
+        for i in range(self.anchor - 10, self.anchor):
+            x[i] = -1.0
+        self.kn = f(x)
         self.cache = {}
 
     def g(self, m, t):
-        """Antwort von Datenchip m (Wert +1) zur Zeit t (20-MS/s-Index, gebrochen)"""
         return st_interp(self.g0, t - 5 * m)
 
     def knv(self, t):
         return st_interp(self.kn, t)
 
     def support(self):
-        """Indexbereich von g0 mit |g0| > 1e-4"""
         if 'sup' not in self.cache:
             idx = [i for i, v in enumerate(self.g0) if abs(v) > 1e-4]
             self.cache['sup'] = (idx[0], idx[-1])
         return self.cache['sup']
+
 
 def st_interp(y, t):
     if t < 0 or t >= len(y) - 1:
@@ -341,15 +352,18 @@ def st_interp(y, t):
     a = t - i
     return y[i] * (1 - a) + y[i + 1] * a
 
+
 _st_models = {}
+
+
 def st_model(kind, bw):
     key = (kind, round(bw, 4))
     if key not in _st_models:
         _st_models[key] = StModel(kind, bw)
     return _st_models[key]
 
+
 def st_bits2chips(bits):
-    """DPSK: Bit 1 = Phasenumkehr am Chipbeginn; c[-1] = -1 (nach SPR); +2 Guard-Chips"""
     c, chips = -1, []
     for b in list(bits) + [0, 0]:
         if b:
@@ -357,17 +371,16 @@ def st_bits2chips(bits):
         chips.append(c)
     return chips
 
-def st_frame_samples(model, chips, off, A, phi, snr, rng,
-                     sample_rate=FS):
-    """Empfangssamples mit fester physikalischer Zeit auf dem 20-MS/s-Modell."""
-    lo, hi = model.support()
+
+def st_frame_samples(model, chips, off, A, phi, snr, rng, sample_rate=FS):
+    lo, hi_idx = model.support()
     rot = A * cmath.exp(1j * phi)
     sig = 1.0 / snr
     out, t = [], off
     step = model_ticks_per_input_sample(sample_rate)
     while t < model.ltot - 1:
         v = model.knv(t)
-        j0 = max(0, math.ceil((t - hi) / 5))
+        j0 = max(0, math.ceil((t - hi_idx) / 5))
         j1 = min(len(chips) - 1, math.floor((t - lo) / 5))
         for j in range(j0, j1 + 1):
             v += chips[j] * model.g(j, t)
@@ -375,8 +388,8 @@ def st_frame_samples(model, chips, off, A, phi, snr, rng,
         t += step
     return out
 
+
 def st_old(r, off, delay, anchor, n, model_step=8.0):
-    """alte Einzelentscheidung: Catmull-Rom in Chipmitten, Vorzeichen von Re(z_b * conj(z_b-1))"""
     def at(t):
         u = (t - off) / model_step
         i = math.floor(u)
@@ -386,7 +399,7 @@ def st_old(r, off, delay, anchor, n, model_step=8.0):
         p0, p1, p2, p3 = r[i - 1], r[i], r[i + 1], r[i + 2]
         return p1 + 0.5 * a * (p2 - p0 + a * (2 * p0 - 5 * p1 + 4 * p2 - p3
                                               + a * (3 * (p1 - p2) + p3 - p0)))
-    prev = at(anchor + delay - 2.5)          # Mitte des Chips vor Bit 0
+    prev = at(anchor + delay - 2.5)
     bits = []
     for b in range(n):
         cur = at(anchor + delay + 5 * b + 2.5)
@@ -394,8 +407,8 @@ def st_old(r, off, delay, anchor, n, model_step=8.0):
         prev = cur
     return bits
 
+
 def st_prepare(rx, r, off, phi, A, L, N, model_step=8.0):
-    """pro Sample: (Schritt, Fensteranfang w, kn, [B_w..B_w+L-1], derotiertes z)"""
     der = cmath.exp(-1j * phi) / A
     out = []
     for k, s in enumerate(r):
@@ -409,9 +422,8 @@ def st_prepare(rx, r, off, phi, A, L, N, model_step=8.0):
         out.append((min(e, N - 1), w, rx.knv(t), Bs, s * der))
     return out
 
+
 def st_viterbi(samples, L, n, N, retm=False):
-    """MLSE über Chips, Gedächtnis L Chips -> 2^(L-1) Zustände.
-       Chips >= n sind Guard (keine Umkehr), Chips >= N gelten als 0."""
     by = {}
     for e, w, kv, Bs, z in samples:
         by.setdefault(e, []).append((w, kv, Bs, z))
@@ -445,15 +457,15 @@ def st_viterbi(samples, L, n, N, retm=False):
         prev = chips[j]
     return (bits, best[0]) if retm else bits
 
+
 def st_eval(tx, rx, n, Ls, count, snr, dt, dphi, seed, old=True,
             sample_rate=FS):
-    """dt: Timingfehler des Empfängers in 20-MS/s-Samples (1 = 0,05 µs), dphi in Grad"""
     rng = random.Random(seed)
     res = {}
     keys = (['old'] if old else []) + list(Ls)
     model_step = model_ticks_per_input_sample(sample_rate)
     for k in keys:
-        res[k] = [0, 0]                       # Bitfehler, fehlerfreie Frames
+        res[k] = [0, 0]
     N = n + 2
     for _ in range(count):
         bits = [rng.randint(0, 1) for _ in range(n)]
@@ -480,11 +492,13 @@ def st_eval(tx, rx, n, Ls, count, snr, dt, dphi, seed, old=True,
             res[k][1] += (e == 0)
     return res
 
+
 def st_print(label, res, count, n):
     for k, (be, ok) in res.items():
         name = 'alt     ' if k == 'old' else 'Viterbi%d' % k
         print('  %-28s %s  BER %7.3f %%   fehlerfrei %6.1f %%'
               % (label, name, 100.0 * be / (count * n), 100.0 * ok / count))
+
 
 def cmd_selftest(args):
     t0 = time.time()
@@ -505,7 +519,7 @@ def cmd_selftest(args):
         print('  -> %s (Kriterium: >= 90 %% fehlerfrei)' % ('BESTANDEN' if ok >= 90 else 'NICHT bestanden'))
 
     if 'b' in parts:
-        print('\n[1b] Gedächtnis (ideal)')
+        print('\n[1b] Gedaechtnis (ideal)')
         res = st_eval(
             tx, tx, n, [3, 4, 5, 6, 7], cnt, snr, 0.0, 0.0,
             args.seed, old=False, sample_rate=args.sample_rate
@@ -527,13 +541,15 @@ def cmd_selftest(args):
             )
             st_print(label, res, cnt, n)
     if 'd' in parts:
-        print('\n[2a] Kanal geschaetzt aus %d Trainingsframes (Bits, frac, Phase bekannt)' % args.train)
+        print('\n[2a] Kanal geschaetzt aus %d Trainingsframes' % args.train)
         h = st_estimate_channel(
             tx, args.train, n, snr, args.seed + 1000, args.sample_rate
         )
         ht = st_true_h(tx)
         err = math.sqrt(sum((a - b) ** 2 for a, b in zip(h, ht)) / sum(b * b for b in ht))
-        print('  rel. Kanalfehler %.4f   delay geschaetzt %.2f Samples' % (err, sum((i + ST_LMIN) * v for i, v in enumerate(h)) / sum(h)))
+        print('  rel. Kanalfehler %.4f   delay geschaetzt %.2f Samples' % (
+            err, sum((i + ST_LMIN) * v for i, v in enumerate(h)) / sum(h)
+        ))
         rx = st_model_from_h(tx, h)
         res = st_eval(
             tx, rx, n, [args.mem], cnt, snr, 0.0, 0.0, args.seed,
@@ -541,8 +557,7 @@ def cmd_selftest(args):
         )
         st_print('geschaetzt', res, cnt, n)
     if 'e' in parts:
-        print('\n[2b] Blindtest (Bits, frac, Phase, Amplitude, Kanal unbekannt), Start %s bw=%.2f'
-              % (args.start, args.start_bw))
+        print('\n[2b] Blindtest, Start %s bw=%.2f' % (args.start, args.start_bw))
         rng = random.Random(args.seed + 2000)
         model_step = model_ticks_per_input_sample(args.sample_rate)
         frames = []
@@ -580,86 +595,38 @@ def cmd_selftest(args):
             if not last and dec:
                 rx = st_model_from_h(
                     tx,
-                    st_ls_frames(
-                        rx.ltot, rx.anchor, dec, args.sample_rate
-                    )
+                    st_ls_frames(rx.ltot, rx.anchor, dec, args.sample_rate)
                 )
     print('\nLaufzeit %.1f s' % (time.time() - t0))
-ST_LMIN, ST_LMAX = -20, 59      # Kanal-Taps bei 20 MS/s: -1,0 .. +2,95 µs
+
 
 def st_input(ltot, anchor, chips):
-    """bekanntes 20-MS/s-Sendesignal: P1, P2, P6, SPR, Datenchips"""
-    x = [0.0] * ltot
-    for i in range(ST_PAD, ST_PAD + 16):      x[i] = 1.0
-    for i in range(ST_PAD + 40, ST_PAD + 56): x[i] = 1.0
-    for i in range(anchor - 35, anchor - 10): x[i] = 1.0
-    for i in range(anchor - 10, anchor):      x[i] = -1.0
+    x = np.zeros(ltot, dtype=np.float64)
+    x[ST_PAD:ST_PAD + 16] = 1.0
+    x[ST_PAD + 40:ST_PAD + 56] = 1.0
+    x[anchor - 35:anchor - 10] = 1.0
+    x[anchor - 10:anchor] = -1.0
     for j, c in enumerate(chips):
-        for i in range(anchor + 5 * j, min(ltot, anchor + 5 * j + 5)):
-            x[i] = float(c)
+        s0 = anchor + 5 * j
+        s1 = min(ltot, s0 + 5)
+        if s0 < ltot:
+            x[s0:s1] = float(c)
     return x
 
-def st_solve(M, v):
-    n = len(v)
-    A = [M[i][:] + [v[i]] for i in range(n)]
-    for c in range(n):
-        p = max(range(c, n), key=lambda r: abs(A[r][c]))
-        A[c], A[p] = A[p], A[c]
-        piv = A[c][c]
-        for r in range(c + 1, n):
-            f = A[r][c] / piv
-            if f:
-                for k in range(c, n + 1):
-                    A[r][k] -= f * A[c][k]
-    h = [0.0] * n
-    for c in range(n - 1, -1, -1):
-        h[c] = (A[c][n] - sum(A[c][k] * h[k] for k in range(c + 1, n))) / A[c][c]
-    return h
 
 def st_estimate_channel(tx, ntrain, n, snr, seed, sample_rate=FS):
-    """LS-Schätzung der reellen Kanalantwort h[l] aus ntrain Frames"""
     rng = random.Random(seed)
-    L = ST_LMAX - ST_LMIN + 1
-    M = [[0.0] * L for _ in range(L)]
-    v = [0.0] * L
+    frames = []
     model_step = model_ticks_per_input_sample(sample_rate)
     for _ in range(ntrain):
         bits = [rng.randint(0, 1) for _ in range(n)]
         chips = st_bits2chips(bits)
         off = rng.uniform(0, model_step)
         phi = rng.uniform(-math.pi, math.pi)
-        r = st_frame_samples(
-            tx, chips, off, 1.0, phi, snr, rng, sample_rate
-        )
-        x = st_input(tx.ltot, tx.anchor, chips)
-        nx = len(x)
-        der = cmath.exp(-1j * phi)
-        for k, s in enumerate(r):
-            t = off + model_step * k
-            i = int(t)
-            a = t - i
-            reg = []
-            for l in range(ST_LMIN, ST_LMAX + 1):
-                m0, m1 = i - l, i + 1 - l
-                x0 = x[m0] if 0 <= m0 < nx else 0.0
-                x1 = x[m1] if 0 <= m1 < nx else 0.0
-                reg.append((1 - a) * x0 + a * x1)
-            if not any(reg):
-                continue
-            y = (s * der).real
-            for p in range(L):
-                rp = reg[p]
-                if rp == 0.0:
-                    continue
-                v[p] += rp * y
-                row = M[p]
-                for q in range(p, L):
-                    row[q] += rp * reg[q]
-    for p in range(L):
-        M[p][p] += 1e-6
-        for q in range(p):
-            M[p][q] = M[q][p]
-    return st_solve(M, v)
+        r = st_frame_samples(tx, chips, off, 1.0, phi, snr, rng, sample_rate)
+        frames.append((r, off, phi, 1.0, chips))
+    return st_ls_frames(tx.ltot, tx.anchor, frames, sample_rate)
+
 
 def st_true_h(tx):
     f, _ = st_make_filter(tx.kind, tx.bw)
@@ -669,30 +636,33 @@ def st_true_h(tx):
     y = f(x)
     return [y[P + l] for l in range(ST_LMIN, ST_LMAX + 1)]
 
+
 def st_model_from_h(tx, h):
-    """Empfängermodell aus geschätzter Kanalantwort (gleiche Schnittstelle wie StModel)"""
     rx = object.__new__(StModel)
     rx.kind, rx.bw, rx.ltot, rx.anchor, rx.cache = 'est', tx.bw, tx.ltot, tx.anchor, {}
-    def conv(x):
-        y = [0.0] * len(x)
-        for m, xv in enumerate(x):
-            if xv:
-                for idx, hv in enumerate(h):
-                    k = m + idx + ST_LMIN
-                    if 0 <= k < len(y):
-                        y[k] += hv * xv
-        return y
-    x = [0.0] * rx.ltot
-    for i in range(rx.anchor, rx.anchor + 5):
-        x[i] = 1.0
+    h_arr = np.asarray(h, dtype=np.float64)
+    lags = np.arange(ST_LMIN, ST_LMAX + 1)
+
+    def conv(x_arr):
+        y = np.zeros(len(x_arr), dtype=np.float64)
+        nz = np.flatnonzero(x_arr)
+        for m in nz:
+            xv = x_arr[m]
+            ks = m + lags
+            valid = (ks >= 0) & (ks < len(y))
+            y[ks[valid]] += h_arr[valid] * xv
+        return y.tolist()
+
+    x = np.zeros(rx.ltot, dtype=np.float64)
+    x[rx.anchor:rx.anchor + 5] = 1.0
     rx.g0 = conv(x)
     rx.kn = conv(st_input(rx.ltot, rx.anchor, []))
-    rx.delay = sum((idx + ST_LMIN) * hv for idx, hv in enumerate(h)) / sum(h)
+    rx.delay = float(np.dot(lags, h_arr) / np.sum(h_arr))
     return rx
 
+
 def st_pre_fit(rx, r, c, model_step):
-    """Präambel-Fit bei Hypothese c: liefert (num, den) oder None"""
-    lim = rx.anchor + rx.delay - 10          # bis 0,5 µs vor den Daten
+    lim = rx.anchor + rx.delay - 10
     num, den = 0j, 0.0
     for k, s in enumerate(r):
         t = c + model_step * k
@@ -703,10 +673,11 @@ def st_pre_fit(rx, r, c, model_step):
         den += kv * kv
     return (num, den) if den > 0 else None
 
+
 def st_blind_decode(rx, r, n, N, L, sample_rate=FS, frame_origin=0.0):
     best_c, best_s = None, -1.0
     model_step = model_ticks_per_input_sample(sample_rate)
-    for c in range(-24, 33):                 # Grobtiming in 0,05-µs-Schritten
+    for c in range(-24, 33):
         f = st_pre_fit(rx, r, frame_origin + c, model_step)
         if f and abs(f[0]) ** 2 / f[1] > best_s:
             best_c, best_s = c, abs(f[0]) ** 2 / f[1]
@@ -727,56 +698,83 @@ def st_blind_decode(rx, r, n, N, L, sample_rate=FS, frame_origin=0.0):
             out = (m, bits, off, phi, A)
     return out
 
+
 def st_ls_frames(ltot, anchor, frames, sample_rate=FS):
-    """LS-Kanal aus entschiedenen Frames: (r, off, phi, A, chips)"""
+    """Vektorisierte LS-Kanalschaetzung ueber numpy."""
     L = ST_LMAX - ST_LMIN + 1
-    M = [[0.0] * L for _ in range(L)]
-    v = [0.0] * L
+    lags = np.arange(ST_LMIN, ST_LMAX + 1, dtype=np.int64)
+    M = np.zeros((L, L), dtype=np.float64)
+    v = np.zeros(L, dtype=np.float64)
     model_step = model_ticks_per_input_sample(sample_rate)
+
     for r, off, phi, A, chips in frames:
         x = st_input(ltot, anchor, chips)
         nx = len(x)
-        der = cmath.exp(-1j * phi) / A
-        for k, s in enumerate(r):
-            t = off + model_step * k
-            i = math.floor(t)
-            a = t - i
-            reg = []
-            for l in range(ST_LMIN, ST_LMAX + 1):
-                m0, m1 = i - l, i + 1 - l
-                x0 = x[m0] if 0 <= m0 < nx else 0.0
-                x1 = x[m1] if 0 <= m1 < nx else 0.0
-                reg.append((1 - a) * x0 + a * x1)
-            if not any(reg):
-                continue
-            y = (s * der).real
-            for p in range(L):
-                rp = reg[p]
-                if rp == 0.0:
-                    continue
-                v[p] += rp * y
-                row = M[p]
-                for q in range(p, L):
-                    row[q] += rp * reg[q]
-    for p in range(L):
-        M[p][p] += 1e-6
-        for q in range(p):
-            M[p][q] = M[q][p]
-    return st_solve(M, v)
+        r_arr = np.asarray(r, dtype=np.complex128)
+        ks = np.arange(len(r_arr), dtype=np.float64)
+        ts = off + model_step * ks
+        idx = np.floor(ts).astype(np.int64)
+        alpha = (ts - idx)[:, None]
 
-# ===================== REALTEST (Stufe 3) =====================
+        m0 = idx[:, None] - lags[None, :]
+        m1 = m0 + 1
+        x0 = np.where((m0 >= 0) & (m0 < nx), x[np.clip(m0, 0, nx - 1)], 0.0)
+        x1 = np.where((m1 >= 0) & (m1 < nx), x[np.clip(m1, 0, nx - 1)], 0.0)
+        X = (1.0 - alpha) * x0 + alpha * x1
+
+        nz = np.any(X != 0.0, axis=1)
+        if not np.any(nz):
+            continue
+        X = X[nz]
+        y = (r_arr[nz] * (cmath.exp(-1j * phi) / A)).real
+        M += X.T @ X
+        v += X.T @ y
+
+    M[np.diag_indices(L)] += 1e-6
+    return np.linalg.solve(M, v).tolist()
+
+
+# ===================== REALTEST (Stufe 3, vektorisiert + parallel) =====================
 def rt_window_params(sample_rate):
     prefix = int(math.ceil(8.0 * sample_rate / 1e6))
     window = int(math.ceil(50.0 * sample_rate / 1e6)) + 1
     return prefix, window
 
-def rt_detect(data, nmax, thr_fac, sample_rate):
-    """P1/P2/P6-Detektor; liefert P1-Indizes und Leistungsschwelle."""
-    ns = min(len(data), nmax)
-    probe = sorted(abs(data[j]) ** 2 for j in range(
-        0, min(ns, 1000000), 97
-    ))
-    thr = probe[len(probe) // 2] * thr_fac
+
+def rt_open_memmap(path, sample_format, max_samples):
+    size = os.path.getsize(path)
+    if sample_format == 'cu8':
+        if size % 2:
+            raise SystemExit('CU8-Dateigroesse ist kein Vielfaches von 2 Bytes.')
+        total = size // 2
+        n = min(total, max_samples) if max_samples > 0 else total
+        if n == 0:
+            return None
+        return np.memmap(path, dtype=np.uint8, mode='r', shape=(n, 2))
+    if size % 4:
+        raise SystemExit('SC16-Dateigroesse ist kein Vielfaches von 4 Bytes.')
+    total = size // 4
+    n = min(total, max_samples) if max_samples > 0 else total
+    if n == 0:
+        return None
+    return np.memmap(path, dtype='<i2', mode='r', shape=(n, 2))
+
+
+def rt_chunk_power(raw_chunk, sample_format, sc16_scale):
+    if sample_format == 'cu8':
+        f = (raw_chunk.astype(np.float32) - 127.5) * (1.0 / 127.5)
+    else:
+        f = raw_chunk.astype(np.float32) * (1.0 / float(sc16_scale))
+    return f[:, 0] * f[:, 0] + f[:, 1] * f[:, 1]
+
+
+def rt_detect(raw_mm, sample_format, sc16_scale, thr_fac, sample_rate):
+    """Vektorisierter P1/P2/P6-Detektor direkt auf memmap."""
+    ns = len(raw_mm)
+    probe_n = min(ns, 1_000_000)
+    probe_pow = rt_chunk_power(raw_mm[:probe_n:97], sample_format, sc16_scale)
+    thr = float(np.median(probe_pow)) * thr_fac
+
     def samples(us):
         return max(1, int(round(us * sample_rate / 1e6)))
 
@@ -790,58 +788,77 @@ def rt_detect(data, nmax, thr_fac, sample_rate):
     p6_stop = samples(7.6)
     skip = samples(34.0)
     guard = samples(40.0)
-    hits, CH, k0, nxt = [], 1000000, 0, 0
+    p6_offs = np.arange(p6_start, p6_stop + 1, dtype=np.int64)
+
+    hits = []
+    CH = 4_000_000
+    k0 = 0
+    nxt = 0
     while k0 < ns - guard:
         k1 = min(ns, k0 + CH + guard)
-        m = [abs(data[j]) ** 2 for j in range(k0, k1)]
-        for i in range(p1_in, len(m) - p6_stop - 1):
-            if m[i] <= thr or k0 + i < nxt:
-                continue
-            p = m[i]
-            if (m[i - p1_in] < thr and m[i + p1_in] > thr
-                    and m[i + p1_pause1] < p / 4
-                    and m[i + p1_pause2] < p / 4
-                    and m[i + p2] > thr and m[i + p2_in] > thr
-                    and m[i + p2_tail] < p / 4
-                    and all(
-                        m[i + q] > thr / 2
-                        for q in range(p6_start, p6_stop + 1)
-                    )):
-                hits.append(k0 + i)
-                nxt = k0 + i + skip
+        m = rt_chunk_power(raw_mm[k0:k1], sample_format, sc16_scale)
+        hi_lim = len(m) - p6_stop - 1
+        if hi_lim <= p1_in:
+            break
+        cand = np.flatnonzero(m[p1_in:hi_lim] > thr) + p1_in
+        if cand.size:
+            p = m[cand]
+            ok = (
+                (m[cand - p1_in] < thr)
+                & (m[cand + p1_in] > thr)
+                & (m[cand + p1_pause1] < p * 0.25)
+                & (m[cand + p1_pause2] < p * 0.25)
+                & (m[cand + p2] > thr)
+                & (m[cand + p2_in] > thr)
+                & (m[cand + p2_tail] < p * 0.25)
+            )
+            cand = cand[ok]
+            if cand.size:
+                p6_ok = np.all(m[cand[:, None] + p6_offs[None, :]] > (thr * 0.5), axis=1)
+                for idx in cand[p6_ok]:
+                    g_idx = k0 + int(idx)
+                    if g_idx >= nxt:
+                        hits.append(g_idx)
+                        nxt = g_idx + skip
         k0 += CH
         print(
-            '  scan %5.1f s  %d Kandidaten' % (k0 / sample_rate, len(hits)),
+            '  scan %5.1f s  %d Kandidaten' % (min(k0, ns) / sample_rate, len(hits)),
             end='\r'
         )
     print()
     return hits, thr
 
-def rt_frame(data, k, thr, sample_rate):
-    """Fenster ab 8 µs vor P1, Länge per Energie bei 23-27 µs, df per Frame"""
+
+def rt_frame(raw_mm, sample_format, sc16_scale, k, thr, sample_rate):
     prefix, window = rt_window_params(sample_rate)
     s0 = k - prefix
-    r = data[s0:s0 + window]
+    seg = raw_mm[s0:s0 + window]
+    if sample_format == 'cu8':
+        f = (seg.astype(np.float64) - 127.5) / 127.5
+    else:
+        f = seg.astype(np.float64) / float(sc16_scale)
+    r = f[:, 0] + 1j * f[:, 1]
+
     energy_start = prefix + int(round(23.0 * sample_rate / 1e6))
     energy_stop = min(len(r), prefix + int(round(27.0 * sample_rate / 1e6)) + 1)
-    e = sum(
-        abs(value) ** 2 for value in r[energy_start:energy_stop]
-    ) / max(1, energy_stop - energy_start)
+    tail = r[energy_start:energy_stop]
+    e = float(np.mean(tail.real * tail.real + tail.imag * tail.imag)) if len(tail) else 0.0
     n = 112 if e > thr else 56
+
     df_lag = max(1, int(round(0.4 * sample_rate / 1e6)))
     df_start = max(df_lag, prefix + int(round(3.6 * sample_rate / 1e6)))
     data_end_us = 19.75 if n == 56 else 33.75
-    end = min(
-        len(r),
-        prefix + int(round(data_end_us * sample_rate / 1e6))
-    )
-    acc = 0j
-    for j in range(df_start, end):
-        d = r[j] * r[j - df_lag].conjugate()
-        acc += d * d
+    end = min(len(r), prefix + int(round(data_end_us * sample_rate / 1e6)))
+    if end > df_start:
+        d = r[df_start:end] * np.conj(r[df_start - df_lag:end - df_lag])
+        acc = complex(np.sum(d * d))
+    else:
+        acc = 0j
     w = cmath.phase(acc) / (2.0 * df_lag) if acc != 0 else 0.0
-    r = [z * cmath.exp(-1j * w * j) for j, z in enumerate(r)]
-    return r, n, w * sample_rate / (2 * math.pi)
+    rot = np.exp(-1j * w * np.arange(len(r), dtype=np.float64))
+    r = r * rot
+    return r.tolist(), n, w * sample_rate / (2 * math.pi)
+
 
 def rt_stats(label, rows):
     aps = [b[-24:] for b in rows]
@@ -864,79 +881,89 @@ def rt_stats(label, rows):
     print('    Laeufe ' + '  '.join('%d: %4.1f %%' % (l, 100.0 * runs[l] / tr) for l in sorted(runs)[:5])
           + '   (soll 50/25/12,5)')
 
-def rt_read_samples(path, sample_format, sc16_scale):
-    if sample_format == 'cu8':
-        with open(path, 'rb') as fi:
-            raw = fi.read()
-        if len(raw) % 2:
-            raise SystemExit('CU8-Dateigroesse ist kein Vielfaches von 2 Bytes.')
-        return [
-            complex(
-                (raw[index] - 127.5) / 127.5,
-                (raw[index + 1] - 127.5) / 127.5,
-            )
-            for index in range(0, len(raw), 2)
-        ]
-    with open(path, 'rb') as fi:
-        raw = fi.read()
-    if len(raw) % 4:
-        raise SystemExit('SC16-Dateigroesse ist kein Vielfaches von 4 Bytes.')
-    samples = []
-    for i, q in struct.iter_unpack('<hh', raw):
-        samples.append(complex(i / sc16_scale, q / sc16_scale))
-    return samples
+
+_W_RX = None
+_W_L = 7
+_W_SR = FS
+_W_ORIGIN = 0.0
+
+
+def _rt_init_worker(rx, L, sample_rate, frame_origin):
+    global _W_RX, _W_L, _W_SR, _W_ORIGIN
+    _W_RX = rx
+    _W_L = L
+    _W_SR = sample_rate
+    _W_ORIGIN = frame_origin
+
+
+def _rt_decode_worker(item):
+    k, r, n = item
+    decoded = st_blind_decode(_W_RX, r, n, n + 2, _W_L, _W_SR, _W_ORIGIN)
+    if decoded is None:
+        return None
+    m, d, c, phi, A = decoded
+    return (k, n, m, d, c, phi, A, r)
+
+
+def _rt_decode_batch(rx, batch, L, sample_rate, frame_origin, workers):
+    items = [(k, r, n) for k, r, n, _ in batch]
+    if workers <= 1 or len(items) < 4:
+        _rt_init_worker(rx, L, sample_rate, frame_origin)
+        return [res for res in map(_rt_decode_worker, items) if res is not None]
+    out = []
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_rt_init_worker,
+        initargs=(rx, L, sample_rate, frame_origin),
+    ) as pool:
+        for res in pool.map(_rt_decode_worker, items, chunksize=max(1, len(items) // (workers * 4))):
+            if res is not None:
+                out.append(res)
+    return out
+
 
 def cmd_realtest(args):
     t0 = time.time()
-    data = rt_read_samples(args.file, args.format, args.sc16_scale)
-    if not data:
-        raise SystemExit('Keine IQ-Daten in der Eingabedatei; Abbruch.')
     sample_rate = args.sample_rate
-    hits, thr = rt_detect(
-        data, int(args.max_sec * sample_rate), args.thr, sample_rate
-    )
+    max_samples = int(args.max_sec * sample_rate) if args.max_sec > 0 else 0
+    raw_mm = rt_open_memmap(args.file, args.format, max_samples)
+    if raw_mm is None:
+        raise SystemExit('Keine IQ-Daten in der Eingabedatei; Abbruch.')
+    hits, thr = rt_detect(raw_mm, args.format, args.sc16_scale, args.thr, sample_rate)
+
     frames = []
     prefix, window = rt_window_params(sample_rate)
     frame_origin = ST_PAD - prefix * model_ticks_per_input_sample(sample_rate)
+    n_total = len(raw_mm)
     for k in hits:
         s0 = k - prefix
-        if s0 >= 0 and s0 + window <= len(data):
-            r, n, df = rt_frame(data, k, thr, sample_rate)
+        if s0 >= 0 and s0 + window <= n_total:
+            r, n, df = rt_frame(raw_mm, args.format, args.sc16_scale, k, thr, sample_rate)
             frames.append((k, r, n, df))
     dfs = sorted(f[3] for f in frames)
     print('Frames %d (112 Bit: %d)  df-Median %.2f kHz'
           % (len(frames), sum(1 for f in frames if f[2] == 112), dfs[len(dfs) // 2] / 1000 if dfs else 0))
     if not frames:
-        raise SystemExit(
-            'Keine gueltigen P6-Kandidaten; Kanaldatei wurde nicht geschrieben.'
-        )
+        raise SystemExit('Keine gueltigen P6-Kandidaten; Kanaldatei wurde nicht geschrieben.')
+
+    workers = args.workers if args.workers > 0 else (os.cpu_count() or 1)
     rx = st_model(args.start, args.start_bw)
     L = args.mem
+
     for rnd in range(args.rounds):
-        dec = []
-        for k, r, n, df in frames[:args.train]:
-            decoded = st_blind_decode(
-                rx, r, n, n + 2, L, sample_rate, frame_origin
-            )
-            if decoded is None:
-                continue
-            m, d, c, phi, A = decoded
-            dec.append((m, (r, c, phi, A, st_bits2chips(d))))
-        if not dec:
+        decoded = _rt_decode_batch(rx, frames[:args.train], L, sample_rate, frame_origin, workers)
+        if not decoded:
             raise SystemExit('Keine decodierbaren Trainingsframes; Abbruch.')
+        dec = [(m, (r, c, phi, A, st_bits2chips(d))) for _, _, m, d, c, phi, A, r in decoded]
         dec.sort(key=lambda x: x[0])
         good = [x[1] for x in dec[:max(10, len(dec) // 2)]]
         print('  Kanalrunde %d: Metrik-Median %.4f' % (rnd, dec[len(dec) // 2][0]))
-        rx = st_model_from_h(
-            rx, st_ls_frames(
-                rx.ltot, rx.anchor, good, sample_rate
-            )
-        )
+        rx = st_model_from_h(rx, st_ls_frames(rx.ltot, rx.anchor, good, sample_rate))
+
     if args.chan_out:
         with open(args.chan_out, 'w') as fo:
             fo.write(
-                'DPSKCHAN2 %d %d %d %.6f %d %d\n' %
-                (
+                'DPSKCHAN2 %d %d %d %.6f %d %d\n' % (
                     int(round(sample_rate)), int(FS_HI), rx.anchor, rx.delay,
                     len(rx.g0), len(rx.kn)
                 )
@@ -944,28 +971,17 @@ def cmd_realtest(args):
             fo.write(' '.join('%.7g' % v for v in rx.g0) + '\n')
             fo.write(' '.join('%.7g' % v for v in rx.kn) + '\n')
         print('  Kanal geschrieben: %s (delay %.2f Samples)' % (args.chan_out, rx.delay))
-    res = []
-    for i, (k, r, n, df) in enumerate(frames):
-        if args.max_decoded > 0 and len(res) >= args.max_decoded:
-            print('\n  max-decoded %d erreicht; weitere Frames nicht decodiert' %
-                  args.max_decoded)
-            break
-        decoded = st_blind_decode(
-            rx, r, n, n + 2, L, sample_rate, frame_origin
-        )
-        if decoded is None:
-            continue
-        m, d, c, phi, A = decoded
-        res.append((k, n, d, m))
-        if i % 50 == 0:
-            print('  decodiert %d/%d' % (i, len(frames)), end='\r')
-    print()
+
+    eval_frames = frames[:args.max_decoded] if args.max_decoded > 0 else frames
+    decoded_final = _rt_decode_batch(rx, eval_frames, L, sample_rate, frame_origin, workers)
+    res = [(k, n, d, m) for k, n, m, d, _, _, _, _ in decoded_final]
+    print('  decodiert %d/%d (workers=%d)' % (len(res), len(frames), workers))
+
     if args.out:
         with open(args.out, 'w') as fo:
             for k, n, d, m in res:
                 fo.write(
-                    '%.1f %d %0*X %.4f\n' %
-                    (
+                    '%.1f %d %0*X %.4f\n' % (
                         k * 1e6 / sample_rate, n, n // 4,
                         int(''.join(map(str, d)), 2), m
                     )
@@ -981,79 +997,82 @@ def cmd_realtest(args):
     rt_stats('alle', [x[2] for x in res])
     rt_stats('beste 50 %', [x[2] for x in res if x[3] <= med])
     print('\nLaufzeit %.1f s' % (time.time() - t0))
-# =================== Ende REALTEST ===================
 
-# =================== Ende SELFTEST ===================
 
-ap = argparse.ArgumentParser(description="P6-Simulator für dump1030")
-sub = ap.add_subparsers(dest='cmd', required=True)
+def main():
+    ap = argparse.ArgumentParser(description="P6-Simulator fuer dump1030")
+    sub = ap.add_subparsers(dest='cmd', required=True)
 
-g = sub.add_parser('gen', help="Testdatei erzeugen")
-g.add_argument('-o', required=True, help="Ausgabedatei (I/Q)")
-g.add_argument('--count', type=int, default=2000, help="Anzahl Frames")
-g.add_argument('--snr', type=float, default=25.0, help="SNR in dB")
-g.add_argument('--bw', type=float, default=1.0, help="Tiefpass-Grenzfrequenz in MHz")
-g.add_argument('--df', type=float, default=-6.4, help="Frequenzversatz in kHz")
-g.add_argument('--len', choices=('56', '112', 'mix'), default='mix')
-g.add_argument('--amp', type=float, default=50.0, help="Signalamplitude (ADC-Einheiten)")
-g.add_argument('--gap', type=float, default=500.0, help="Abstand der Frames in µs")
-g.add_argument('--sample-rate', type=float, default=FS)
-g.add_argument(
-    '--format', choices=('cu8', 'sc16'), default='cu8',
-    help="Ausgangsformat; SC16 ist little-endian int16 I/Q",
-)
-g.add_argument('--sc16-scale', type=float, default=2048.0,
-               help="SC16-Vollaussteuerung")
-g.add_argument('--drop-ppm', type=float, default=0.0,
-               help="Sample-Drops (z.B. 1850 wie gemessen)")
-g.add_argument('--seed', type=int, default=1)
+    g = sub.add_parser('gen', help="Testdatei erzeugen")
+    g.add_argument('-o', required=True, help="Ausgabedatei (I/Q)")
+    g.add_argument('--count', type=int, default=2000, help="Anzahl Frames")
+    g.add_argument('--snr', type=float, default=25.0, help="SNR in dB")
+    g.add_argument('--bw', type=float, default=1.0, help="Tiefpass-Grenzfrequenz in MHz")
+    g.add_argument('--df', type=float, default=-6.4, help="Frequenzversatz in kHz")
+    g.add_argument('--len', choices=('56', '112', 'mix'), default='mix')
+    g.add_argument('--amp', type=float, default=50.0, help="Signalamplitude (ADC-Einheiten)")
+    g.add_argument('--gap', type=float, default=500.0, help="Abstand der Frames in us")
+    g.add_argument('--sample-rate', type=float, default=FS)
+    g.add_argument('--format', choices=('cu8', 'sc16'), default='cu8',
+                   help="Ausgangsformat; SC16 ist little-endian int16 I/Q")
+    g.add_argument('--sc16-scale', type=float, default=2048.0, help="SC16-Vollaussteuerung")
+    g.add_argument('--drop-ppm', type=float, default=0.0, help="Sample-Drops")
+    g.add_argument('--seed', type=int, default=1)
 
-c = sub.add_parser('compare', help="dump1030-Log gegen Wahrheit prüfen")
-c.add_argument('truth')
-c.add_argument('log')
+    c = sub.add_parser('compare', help="dump1030-Log gegen Wahrheit pruefen")
+    c.add_argument('truth')
+    c.add_argument('log')
 
-p_st = sub.add_parser('selftest', help="MLSE/Viterbi-Machbarkeitstest")
-p_st.add_argument('--filter', choices=['fir', 'iir'], default='fir')
-p_st.add_argument('--bw', type=float, default=1.0)
-p_st.add_argument('--snr', type=float, default=25.0)
-p_st.add_argument('--sample-rate', type=float, default=FS)
-p_st.add_argument('--nbits', type=int, choices=[56, 112], default=56)
-p_st.add_argument('--count', type=int, default=200)
-p_st.add_argument('--mem', type=int, default=4)
-p_st.add_argument('--part', default='all')
-p_st.add_argument('--seed', type=int, default=1)
-p_st.add_argument('--train', type=int, default=100)
-p_st.add_argument('--start', choices=['fir', 'iir'], default='fir')
-p_st.add_argument('--start-bw', type=float, default=1.0)
-p_st.add_argument('--rounds', type=int, default=3)
+    p_st = sub.add_parser('selftest', help="MLSE/Viterbi-Machbarkeitstest")
+    p_st.add_argument('--filter', choices=['fir', 'iir'], default='fir')
+    p_st.add_argument('--bw', type=float, default=1.0)
+    p_st.add_argument('--snr', type=float, default=25.0)
+    p_st.add_argument('--sample-rate', type=float, default=FS)
+    p_st.add_argument('--nbits', type=int, choices=[56, 112], default=56)
+    p_st.add_argument('--count', type=int, default=200)
+    p_st.add_argument('--mem', type=int, default=4)
+    p_st.add_argument('--part', default='all')
+    p_st.add_argument('--seed', type=int, default=1)
+    p_st.add_argument('--train', type=int, default=100)
+    p_st.add_argument('--start', choices=['fir', 'iir'], default='fir')
+    p_st.add_argument('--start-bw', type=float, default=1.0)
+    p_st.add_argument('--rounds', type=int, default=3)
 
-p_rt = sub.add_parser('realtest', help="Echte IQ-Datei dekodieren")
-p_rt.add_argument('file')
-p_rt.add_argument('--max-sec', type=float, default=30.0)
-p_rt.add_argument('--sample-rate', type=float, default=FS)
-p_rt.add_argument(
-    '--format', choices=('cu8', 'sc16'), default='cu8',
-    help="Eingangsformat; SC16 ist little-endian int16 I/Q",
-)
-p_rt.add_argument('--sc16-scale', type=float, default=2048.0)
-p_rt.add_argument('--thr', type=float, default=10.0)
-p_rt.add_argument('--train', type=int, default=150)
-p_rt.add_argument(
-    '--max-decoded',
-    type=int,
-    default=300,
-    help="after this many decoded frames stop (0 = unlimited)",
-)
-p_rt.add_argument('--rounds', type=int, default=3)
-p_rt.add_argument('--mem', type=int, default=7)
-p_rt.add_argument('--start', choices=['fir', 'iir'], default='fir')
-p_rt.add_argument('--start-bw', type=float, default=1.0)
-p_rt.add_argument('--out', default='')
-p_rt.add_argument('--chan-out', default='')
+    p_rt = sub.add_parser('realtest', help="Echte IQ-Datei dekodieren")
+    p_rt.add_argument('file')
+    p_rt.add_argument('--max-sec', type=float, default=30.0)
+    p_rt.add_argument('--sample-rate', type=float, default=FS)
+    p_rt.add_argument('--format', choices=('cu8', 'sc16'), default='cu8',
+                      help="Eingangsformat; SC16 ist little-endian int16 I/Q")
+    p_rt.add_argument('--sc16-scale', type=float, default=2048.0)
+    p_rt.add_argument('--thr', type=float, default=10.0)
+    p_rt.add_argument('--train', type=int, default=150)
+    p_rt.add_argument('--max-decoded', type=int, default=300,
+                      help="after this many decoded frames stop (0 = unlimited)")
+    p_rt.add_argument('--rounds', type=int, default=3)
+    p_rt.add_argument('--mem', type=int, default=7)
+    p_rt.add_argument('--start', choices=['fir', 'iir'], default='fir')
+    p_rt.add_argument('--start-bw', type=float, default=1.0)
+    p_rt.add_argument('--workers', type=int, default=0,
+                      help="Anzahl paralleler Worker-Prozesse (0 = alle Kerne)")
+    p_rt.add_argument('--out', default='')
+    p_rt.add_argument('--chan-out', default='')
 
-args = ap.parse_args()
-if hasattr(args, 'sample_rate') and args.sample_rate <= 0:
-    ap.error('--sample-rate must be positive')
-if hasattr(args, 'sc16_scale') and args.sc16_scale <= 0:
-    ap.error('--sc16-scale must be positive')
-cmd_realtest(args) if args.cmd == 'realtest' else (cmd_selftest(args) if args.cmd == 'selftest' else (gen(args) if args.cmd == 'gen' else compare(args)))
+    args = ap.parse_args()
+    if hasattr(args, 'sample_rate') and args.sample_rate <= 0:
+        ap.error('--sample-rate must be positive')
+    if hasattr(args, 'sc16_scale') and args.sc16_scale <= 0:
+        ap.error('--sc16-scale must be positive')
+
+    if args.cmd == 'realtest':
+        cmd_realtest(args)
+    elif args.cmd == 'selftest':
+        cmd_selftest(args)
+    elif args.cmd == 'gen':
+        gen(args)
+    else:
+        compare(args)
+
+
+if __name__ == '__main__':
+    main()
