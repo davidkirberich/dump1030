@@ -917,6 +917,10 @@ def cmd_realtest(args):
         print('  Kanal geschrieben: %s (delay %.2f Samples)' % (args.chan_out, rx.delay))
     res = []
     for i, (k, r, n, df) in enumerate(frames):
+        if args.max_decoded > 0 and len(res) >= args.max_decoded:
+            print('\n  max-decoded %d erreicht; weitere Frames nicht decodiert' %
+                  args.max_decoded)
+            break
         decoded = st_blind_decode(
             rx, r, n, n + 2, L, sample_rate, frame_origin
         )
@@ -994,6 +998,12 @@ p_rt.add_argument('--max-sec', type=float, default=30.0)
 p_rt.add_argument('--sample-rate', type=float, default=FS)
 p_rt.add_argument('--thr', type=float, default=10.0)
 p_rt.add_argument('--train', type=int, default=150)
+p_rt.add_argument(
+    '--max-decoded',
+    type=int,
+    default=300,
+    help="after this many decoded frames stop (0 = unlimited)",
+)
 p_rt.add_argument('--rounds', type=int, default=3)
 p_rt.add_argument('--mem', type=int, default=7)
 p_rt.add_argument('--start', choices=['fir', 'iir'], default='fir')

@@ -13,3 +13,5 @@ __pycache__/
 *.py[cod]
 *.swp
 *.swo
+/experiments/
+/tools/downsample/downsample_sc16_to_cu8_fast
