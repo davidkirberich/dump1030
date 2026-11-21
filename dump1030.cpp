@@ -1,6 +1,5 @@
 // dump1030 - SSR-Abfrage-Detektor (1030 MHz)
-// Build: g++ -O2 -std=gnu++17 -Wall -Wextra -pthread \
-//   dump1030.cpp -lrtlsdr -o dump1030
+// Build: make [WITH_RTLSDR=1] [WITH_PLUTO=0]
 
 #include <algorithm>
 #include <array>
@@ -17,6 +16,8 @@
 #include <ctime>
 #include <fstream>
 #include <limits>
+#include <memory>
+#include <poll.h>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -25,13 +26,24 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#ifndef WITH_RTLSDR
+#define WITH_RTLSDR 1
+#endif
+#ifndef WITH_PLUTO
+#define WITH_PLUTO 0
+#endif
+#if WITH_RTLSDR
 #include <rtl-sdr.h>
+#endif
+#if WITH_PLUTO
+#include <iio.h>
+#endif
 
 // ---------- Konstanten ----------
 static constexpr double PI           = 3.14159265358979323846;
 static const uint32_t DEFAULT_FREQ   = 1030000000;
 static const uint32_t DEFAULT_RATE   = 2500000;
-static const uint32_t MIN_RATE       = 2400000;
+static const uint32_t MIN_RATE       = 2000000;
 static const uint32_t MAX_RATE       = 30000000;
 static const uint32_t DEFAULT_LEN    = 262144;   // Bytes (I/Q)
 static const uint32_t MIN_LEN        = 16384;
@@ -121,6 +133,57 @@ struct Average {
     unsigned value() const { return n ? (unsigned)(sum / n) : 0; }
 };
 
+enum class InputFormat : uint8_t {
+    CU8,
+    SC16
+};
+
+struct SampleBlock {
+    InputFormat format = InputFormat::CU8;
+    double sample_rate = 0.0;
+    std::vector<uint8_t> raw;
+    std::vector<uint8_t> magnitude;
+
+    size_t sample_count() const {
+        return raw.size() / (format == InputFormat::CU8 ? 2u : 4u);
+    }
+
+    std::complex<double> iq_at(size_t sample, double sc16_scale) const {
+        if (format == InputFormat::CU8) {
+            const uint8_t* p = raw.data() + 2 * sample;
+            return {
+                static_cast<double>(p[0]) / 127.5 - 1.0,
+                static_cast<double>(p[1]) / 127.5 - 1.0
+            };
+        }
+        int16_t i, q;
+        const size_t offset = 4 * sample;
+        memcpy(&i, raw.data() + offset, sizeof(i));
+        memcpy(&q, raw.data() + offset + sizeof(i), sizeof(q));
+        return {
+            static_cast<double>(i) / sc16_scale,
+            static_cast<double>(q) / sc16_scale
+        };
+    }
+};
+
+enum class ReadStatus : uint8_t {
+    DATA,
+    EOF_REACHED,
+    ERROR
+};
+
+class SampleSource {
+public:
+    virtual ~SampleSource() = default;
+    virtual bool open() = 0;
+    virtual ReadStatus read_block(SampleBlock& out) = 0;
+    virtual double sample_rate() const = 0;
+    virtual bool live() const = 0;
+    virtual void cancel() {}
+    virtual void close() = 0;
+};
+
 // ---------- Timing (zur Laufzeit aus der Samplerate berechnet) ----------
 struct Timing {
     double sps = 2.5;          // Samples pro us
@@ -197,16 +260,15 @@ struct State {
     pthread_t       reader_thread{};
     pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
     pthread_cond_t  cond  = PTHREAD_COND_INITIALIZER;
-    std::vector<uint8_t> iq_buf;     // vom Reader befuellt
-    uint32_t        iq_len = 0;      // gueltige Bytes in iq_buf
+    SampleBlock     iq_buf;          // vom Reader befuellt
     bool            data_ready = false;
     bool            reader_done = false;
     bool            reader_error = false;
     uint64_t        dropped = 0;     // verworfene Puffer (Main zu langsam)
 
     // Verarbeitung
-    std::vector<uint8_t>  iq_work;   // Arbeitskopie
-    std::vector<uint8_t>  iq_hist;   // Overlap + neue Samples (I/Q)
+    SampleBlock     iq_work;         // Arbeitskopie
+    SampleBlock     iq_hist;         // Overlap + neue Samples im Eingangsformat
     std::vector<uint8_t>  mag;       // Overlap + neue Samples (Magnitude)
     uint32_t              overlap = 0;
     uint32_t              prefix_keep = 0; // bereits gescannte Praefix-Historie am Pufferanfang
@@ -218,6 +280,7 @@ struct State {
     // Optionen
     Thresholds th;
     Timing   tm;
+    InputFormat input_format = InputFormat::CU8;
     uint32_t data_len   = DEFAULT_LEN;
     uint32_t freq       = DEFAULT_FREQ;
     uint32_t samplerate = DEFAULT_RATE;
@@ -241,6 +304,15 @@ struct State {
     double   p6_min_lock = 0.50;
     int      p6_timing_radius = 1;
     const char *filename = nullptr;
+    double sc16_scale = 2048.0;
+    std::string input_name;
+    std::string pluto_uri = "ip:192.168.2.1";
+    uint32_t pluto_bandwidth = 0;
+    double pluto_gain = 52.0;
+    bool pluto_gain_set = false;
+    bool use_pluto = false;
+    bool input_format_set = false;
+    std::unique_ptr<SampleSource> source;
 
     // Statistik
     Counters cur, cum;
@@ -248,11 +320,12 @@ struct State {
     double   last_burst_us = -1.0;
     uint64_t uplink_ok = 0;
 
-    // RTL-SDR / Datei
+    // RTL-SDR
+#if WITH_RTLSDR
     rtlsdr_dev_t *dev = nullptr;
-    int fd = -1;
+#endif
 
-    // Ausgabedirectory fuer JSONL und .cu8
+    // Ausgabedirectory fuer JSONL und Roh-I/Q
     std::string out_dir;
     bool        save_iq  = false;
     FILE*       jsonl_fp = nullptr;
@@ -263,8 +336,10 @@ static State G;
 static_assert(std::atomic<bool>::is_always_lock_free,
               "g_exit muss lock-free sein (Signal-Handler)");
 static std::atomic<bool> g_exit{false};
+static std::atomic<int> g_signal{0};
 
-static void sigHandler(int) {
+static void sigHandler(int signal_number) {
+    g_signal.store(signal_number);
     g_exit = true;   // nur async-signal-safe Operationen
 }
 
@@ -273,13 +348,15 @@ static void closeOutputs();
 // Nur aus dem Main-Thread vor Start des Reader-Threads aufrufen.
 [[noreturn]] static void die(const char *msg) {
     fprintf(stderr, "Fehler: %s\n", msg);
-    if (G.dev) { rtlsdr_close(G.dev); G.dev = nullptr; }
-    if (G.fd >= 0) { close(G.fd); G.fd = -1; }
+#if WITH_RTLSDR
+    if (G.dev) { rtlsdr_close(G.dev);     G.dev = nullptr; }
+#endif
+    if (G.source) G.source->close();
     closeOutputs();
     exit(1);
 }
 
-// ---------- JSONL/cu8 Ausgabe ----------
+// ---------- JSONL/Roh-I/Q-Ausgabe ----------
 
 static bool ensureDir(const std::string& path) {
     if (path.empty()) return false;
@@ -317,7 +394,9 @@ static bool initOutputs() {
     }
 
     if (G.save_iq) {
-        std::string iq_path = G.out_dir + "/raw_" + ts + ".cu8";
+        const char* extension =
+            G.input_format == InputFormat::CU8 ? ".cu8" : ".sc16";
+        std::string iq_path = G.out_dir + "/raw_" + ts + extension;
         G.iq_fp = fopen(iq_path.c_str(), "wb");
         if (!G.iq_fp) {
             fprintf(stderr, "Fehler: Kann '%s' nicht oeffnen: %s\n",
@@ -453,38 +532,175 @@ static void buildLut() {
     }
 }
 
+static size_t sampleBytes(InputFormat format) {
+    return format == InputFormat::CU8 ? 2u : 4u;
+}
+
+static void prepareSampleBlock(SampleBlock& block) {
+    const size_t samples = block.sample_count();
+    block.magnitude.resize(samples);
+    const uint8_t* raw = block.raw.data();
+    uint8_t* magnitude = block.magnitude.data();
+    if (block.format == InputFormat::CU8) {
+        const uint8_t* lut = G.lut16.data();
+        for (size_t j = 0; j < samples; ++j)
+            magnitude[j] = lut[raw[2 * j] | (raw[2 * j + 1] << 8)];
+        return;
+    }
+
+    constexpr uint32_t FIXED_SHIFT = 24;
+    const uint64_t magnitude_gain = std::max<uint64_t>(
+        1,
+        static_cast<uint64_t>(llround(
+            (255.0 * 8.0 / 11.0 / G.sc16_scale) *
+            static_cast<double>(uint64_t{1} << FIXED_SHIFT)
+        ))
+    );
+    for (size_t j = 0; j < samples; ++j) {
+        int16_t raw_i, raw_q;
+        memcpy(&raw_i, raw + 4 * j, sizeof(raw_i));
+        memcpy(&raw_q, raw + 4 * j + 2, sizeof(raw_q));
+        const uint32_t abs_i =
+            static_cast<uint32_t>(raw_i < 0 ? -static_cast<int32_t>(raw_i)
+                                             : raw_i);
+        const uint32_t abs_q =
+            static_cast<uint32_t>(raw_q < 0 ? -static_cast<int32_t>(raw_q)
+                                             : raw_q);
+        const uint32_t high = std::max(abs_i, abs_q);
+        const uint32_t low = std::min(abs_i, abs_q);
+        const uint64_t value =
+            ((8ULL * high + 3ULL * low) * magnitude_gain) >>
+            (FIXED_SHIFT + 3);
+        magnitude[j] = static_cast<uint8_t>(
+            std::min<uint64_t>(255, value)
+        );
+    }
+}
+
+class FileSampleSource : public SampleSource {
+public:
+    FileSampleSource(std::string path, InputFormat format,
+                     uint32_t block_bytes, double rate)
+        : path_(std::move(path)), format_(format), block_bytes_(block_bytes),
+          rate_(rate) {}
+    ~FileSampleSource() override { close(); }
+
+    bool open() override {
+        if (path_ == "-") {
+            fd_ = STDIN_FILENO;
+            return true;
+        }
+        fd_ = ::open(path_.c_str(), O_RDONLY);
+        if (fd_ < 0) {
+            fprintf(stderr, "Fehler: Datei '%s' nicht lesbar: %s\n",
+                    path_.c_str(), strerror(errno));
+            return false;
+        }
+        return true;
+    }
+
+    ReadStatus read_block(SampleBlock& out) override {
+        out.format = format_;
+        out.sample_rate = rate_;
+        out.raw.resize(block_bytes_);
+        size_t got = 0;
+        bool io_error = false;
+        while (got < out.raw.size()) {
+            if (g_exit) return ReadStatus::EOF_REACHED;
+            if (fd_ == STDIN_FILENO) {
+                pollfd fd{STDIN_FILENO, POLLIN, 0};
+                int ready;
+                do {
+                    ready = poll(&fd, 1, 100);
+                } while (ready < 0 && errno == EINTR && !g_exit);
+                if (g_exit) return ReadStatus::EOF_REACHED;
+                if (ready < 0) {
+                    fprintf(stderr, "Pipe-Abfrage fehlgeschlagen: %s\n",
+                            strerror(errno));
+                    return ReadStatus::ERROR;
+                }
+                if (ready == 0) continue;
+            }
+            const ssize_t n =
+                read(fd_, out.raw.data() + got, out.raw.size() - got);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    if (g_exit) return ReadStatus::EOF_REACHED;
+                    continue;
+                }
+                fprintf(stderr, "Lesefehler: %s\n", strerror(errno));
+                io_error = true;
+                break;
+            }
+            if (n == 0) break;
+            got += static_cast<size_t>(n);
+        }
+        const size_t unit = sampleBytes(format_);
+        if (got % unit != 0) {
+            fprintf(stderr,
+                    "Eingabe endet mitten in einem I/Q-Sample (%zu Restbytes)\n",
+                    got % unit);
+            out.raw.resize(0);
+            return ReadStatus::ERROR;
+        }
+        out.raw.resize(got);
+        if (got > 0) prepareSampleBlock(out);
+        if (io_error) return ReadStatus::ERROR;
+        if (got == 0) return ReadStatus::EOF_REACHED;
+        return ReadStatus::DATA;
+    }
+
+    double sample_rate() const override { return rate_; }
+    bool live() const override { return false; }
+
+    void close() override {
+        if (fd_ >= 0 && fd_ != STDIN_FILENO) ::close(fd_);
+        fd_ = -1;
+    }
+
+private:
+    std::string path_;
+    InputFormat format_;
+    uint32_t block_bytes_;
+    double rate_;
+    int fd_ = -1;
+};
+
 // Anzahl gueltiger (echter, nicht Reserve-) Samples im aktuellen Block.
 static uint32_t g_valid_samples = 0;
 
 static void ensureCapacity(uint32_t total) {
     size_t need = (size_t)total + G.lookahead;
     if (G.mag.size() < need)          G.mag.resize(need);
-    if (G.iq_hist.size() < 2 * need)  G.iq_hist.resize(2 * need);
+    if (G.iq_hist.raw.size() < sampleBytes(G.input_format) * need)
+        G.iq_hist.raw.resize(sampleBytes(G.input_format) * need);
 }
 
 // Haengt iq_work[0..len) hinter den Overlap und berechnet die Magnitude.
 // Rueckgabe: Anzahl gueltiger Samples (Overlap + neue).
-static uint32_t computeMagnitude(uint32_t len, bool final) {
-    uint32_t n_new = len / 2;                    // ungerades Byte ignorieren
+static uint32_t computeMagnitude(const SampleBlock& block, bool final) {
+    const uint32_t n_new =
+        static_cast<uint32_t>(block.sample_count());
     uint32_t total = G.overlap + n_new;
     ensureCapacity(total);
 
-    uint8_t *iq = G.iq_hist.data();
-    if (n_new)
-        memcpy(iq + 2 * (size_t)G.overlap, G.iq_work.data(), 2 * (size_t)n_new);
-
-    const uint8_t *src = iq + 2 * (size_t)G.overlap;
+    uint8_t *iq = G.iq_hist.raw.data();
+    G.iq_hist.format = G.input_format;
+    G.iq_hist.sample_rate = G.samplerate;
+    const size_t stride = sampleBytes(G.input_format);
+    if (n_new) {
+        memcpy(iq + stride * (size_t)G.overlap,
+               block.raw.data(), stride * (size_t)n_new);
+    }
     uint8_t *m = G.mag.data() + G.overlap;
-    const uint8_t *lut = G.lut16.data();
-    for (uint32_t j = 0; j < n_new; j++)
-        m[j] = lut[src[2 * j] | (src[2 * j + 1] << 8)];
+    if (n_new) memcpy(m, block.magnitude.data(), n_new);
 
     if (final) {
         std::fill(G.mag.begin() + total,
                   G.mag.begin() + total + G.lookahead, 0);
-        std::fill(G.iq_hist.begin() + 2 * (size_t)total,
-                  G.iq_hist.begin() + 2 * ((size_t)total + G.lookahead),
-                  128);
+        std::fill(G.iq_hist.raw.begin() + stride * (size_t)total,
+                  G.iq_hist.raw.begin() + stride * ((size_t)total + G.lookahead),
+                  0);
     }
     return total;
 }
@@ -503,9 +719,11 @@ static void keepOverlap(uint32_t total, uint32_t consumed) {
     const uint32_t start = consumed - history;
     uint32_t keep = total - start;
     if (keep && start > 0) {
+        const size_t stride = sampleBytes(G.input_format);
         memmove(G.mag.data(), G.mag.data() + start, keep);
-        memmove(G.iq_hist.data(), G.iq_hist.data() + 2 * (size_t)start,
-                2 * (size_t)keep);
+        memmove(G.iq_hist.raw.data(),
+                G.iq_hist.raw.data() + stride * (size_t)start,
+                stride * (size_t)keep);
     }
     G.sample_base += start;
     G.overlap = keep;
@@ -640,8 +858,7 @@ static const char *codeName(MsgCode c) {
 using cd = std::complex<double>;
 
 static inline cd iqAt(int k) {
-    const uint8_t *p = G.iq_hist.data() + 2 * (size_t)k;
-    return cd((double)p[0] - 127.5, (double)p[1] - 127.5);
+    return G.iq_hist.iq_at(static_cast<size_t>(k), G.sc16_scale);
 }
 
 // Catmull-Rom-Interpolation ueber 4 Stuetzstellen (s0-1 .. s0+2).
@@ -1170,7 +1387,7 @@ struct BlindResult {
 };
 
 // wie rt_frame: Fenster holen, df schaetzen und entfernen
-static bool bdFrame(const uint8_t* iq, size_t nPairs, long k, int n,
+static bool bdFrame(size_t nPairs, long k, int n,
                     std::vector<std::complex<float>>& r, double& dfHz)
 {
     const int prefix_samples = G.tm.ceil_s(BD_PREFIX_US);
@@ -1184,10 +1401,11 @@ static bool bdFrame(const uint8_t* iq, size_t nPairs, long k, int n,
     const int first = static_cast<int>(std::max<long>(0, -s0));
     for (int j = first; j < window_samples; ++j) {
         const size_t sample = static_cast<size_t>(s0 + j);
-        r[j] = {
-            iq[2 * sample] - 127.5f,
-            iq[2 * sample + 1] - 127.5f
-        };
+        const cd value = iqAt(static_cast<int>(sample));
+        r[j] = std::complex<float>(
+            static_cast<float>(value.real()),
+            static_cast<float>(value.imag())
+        );
     }
     int df_start = prefix_samples + G.tm.s(BD_DF_START_US);
     int data_end = prefix_samples + G.tm.s(
@@ -1231,12 +1449,12 @@ static bool bdPreFit(const DpskChannel& ch, const std::complex<float>* r, int nr
 }
 
 // wie st_blind_decode: Grobtiming per Praeambel, Feintiming per Viterbi-Metrik
-bool blindDecodeDpsk(const DpskChannel& ch, const uint8_t* iq, size_t nPairs,
+bool blindDecodeDpsk(const DpskChannel& ch, size_t nPairs,
                      long k, int n, BlindResult& out)
 {
     static thread_local std::vector<std::complex<float>> r;
     static thread_local ViterbiResult cand;
-    if (!bdFrame(iq, nPairs, k, n, r, out.dfHz)) return false;
+    if (!bdFrame(nPairs, k, n, r, out.dfHz)) return false;
     const int sample_count = (int)r.size();
     const double model_step = modelTicksPerInputSample();
     const double frame_origin =
@@ -1511,12 +1729,12 @@ static UplinkResult decodeUplink(int i, int p1_ref, int nbits) {
     static thread_local BlindResult blind;
     const size_t nPairs = g_valid_samples;
     bool blind_ready = blindDecodeDpsk(
-        g_chan, G.iq_hist.data(), nPairs, i, nbits, blind
+        g_chan, nPairs, i, nbits, blind
     );
     if (blind_ready && nbits == 56 && blindDecodeNeeds112(blind)) {
         nbits = 112;
         blind_ready = blindDecodeDpsk(
-            g_chan, G.iq_hist.data(), nPairs, i, nbits, blind
+            g_chan, nPairs, i, nbits, blind
         );
     }
     R.nbits = nbits;
@@ -2022,8 +2240,12 @@ static void printStats(uint64_t samples) {
     G.order.clear();
 }
 
-// ---------- RTL-SDR ----------
-static void initRtlsdr() {
+#if WITH_RTLSDR
+class RtlSampleSource : public SampleSource {
+public:
+    ~RtlSampleSource() override { close(); }
+
+    bool open() override {
     int count = (int)rtlsdr_get_device_count();
     if (count <= 0) die("Keine RTL-SDR-Geraete gefunden");
     fprintf(stderr, "%d Geraet(e) gefunden:\n", count);
@@ -2076,80 +2298,205 @@ static void initRtlsdr() {
     rtlsdr_reset_buffer(G.dev);
     fprintf(stderr, "Gain laut Geraet: %.1f dB, %.3f MS/s, %d ppm\n",
             rtlsdr_get_tuner_gain(G.dev) / 10.0, G.samplerate / 1e6, G.ppm);
-}
-
-static void rtlsdrCallback(unsigned char *buf, uint32_t len, void *) {
-    if (g_exit) return;
-    pthread_mutex_lock(&G.mutex);
-    if (G.data_ready) {
-        G.dropped++;
-    } else {
-        if (len > G.data_len) len = G.data_len;
-        memcpy(G.iq_buf.data(), buf, len);
-        G.iq_len = len;
-        G.data_ready = true;
-        pthread_cond_signal(&G.cond);
+        return true;
     }
-    pthread_mutex_unlock(&G.mutex);
-    if (!G.continuous) rtlsdr_cancel_async(G.dev);
-}
 
-// ---------- Datei-Eingabe ----------
-static void readFile() {
-    std::vector<uint8_t> tmp(G.data_len);
-    bool io_error = false;
-    while (!g_exit) {
-        size_t got = 0;
-        while (got < tmp.size()) {
-            ssize_t n = read(G.fd, tmp.data() + got, tmp.size() - got);
-            if (n < 0) {
-                if (errno == EINTR) continue;
-                fprintf(stderr, "Lesefehler: %s\n", strerror(errno));
-                io_error = true;
-                break;
+    ReadStatus read_block(SampleBlock& out) override {
+        out.format = InputFormat::CU8;
+        out.sample_rate = G.samplerate;
+        out.raw.resize(G.data_len);
+        int nread = 0;
+        const int rc = rtlsdr_read_sync(
+            G.dev, out.raw.data(), G.data_len, &nread
+        );
+        if (rc < 0 || nread <= 0) {
+            if (!g_exit && rc < 0)
+                fprintf(stderr, "rtlsdr_read_sync() lieferte %d\n", rc);
+            return g_exit ? ReadStatus::EOF_REACHED : ReadStatus::ERROR;
+        }
+        out.raw.resize(static_cast<size_t>(nread) & ~(size_t)1);
+        prepareSampleBlock(out);
+        return ReadStatus::DATA;
+    }
+
+    double sample_rate() const override { return G.samplerate; }
+    bool live() const override { return true; }
+
+    void cancel() override {
+#if WITH_RTLSDR
+        if (G.dev) rtlsdr_cancel_async(G.dev);
+#endif
+    }
+
+    void close() override {
+        if (G.dev) {
+            rtlsdr_cancel_async(G.dev);
+            rtlsdr_close(G.dev);
+            G.dev = nullptr;
+        }
+    }
+};
+#endif
+
+#if WITH_PLUTO
+class PlutoSampleSource : public SampleSource {
+public:
+    ~PlutoSampleSource() override { close(); }
+
+    bool open() override {
+        context_ = iio_create_context_from_uri(G.pluto_uri.c_str());
+        if (!context_) {
+            fprintf(stderr, "Pluto: Kontext '%s' nicht erreichbar\n",
+                    G.pluto_uri.c_str());
+            return false;
+        }
+        phy_ = iio_context_find_device(context_, "ad9361-phy");
+        capture_ = iio_context_find_device(context_, "cf-ad9361-lpc");
+        if (!phy_ || !capture_) {
+            fprintf(stderr, "Pluto: ad9361-phy/cf-ad9361-lpc nicht gefunden\n");
+            close();
+            return false;
+        }
+        struct iio_channel* lo = iio_device_find_channel(
+            phy_, "altvoltage0", true
+        );
+        struct iio_channel* phy_rx = iio_device_find_channel(
+            phy_, "voltage0", false
+        );
+        struct iio_channel* cap_i = iio_device_find_channel(
+            capture_, "voltage0", false
+        );
+        struct iio_channel* cap_q = iio_device_find_channel(
+            capture_, "voltage1", false
+        );
+        if (!lo || !phy_rx || !cap_i || !cap_q) {
+            fprintf(stderr, "Pluto: benoetigte I/Q-Kanaele nicht gefunden\n");
+            close();
+            return false;
+        }
+        if (iio_channel_attr_write_longlong(lo, "frequency", G.freq) < 0 ||
+            iio_channel_attr_write_longlong(
+                phy_rx, "sampling_frequency", G.samplerate
+            ) < 0 ||
+            iio_channel_attr_write(
+                phy_rx, "gain_control_mode", "manual"
+            ) < 0) {
+            fprintf(stderr, "Pluto: Frequenz/Rate/Gain-Modus nicht setzbar\n");
+            close();
+            return false;
+        }
+        long long actual_rate = 0;
+        if (iio_channel_attr_read_longlong(
+                phy_rx, "sampling_frequency", &actual_rate
+            ) >= 0 && actual_rate > 0) {
+            if (actual_rate < MIN_RATE || actual_rate > MAX_RATE) {
+                fprintf(stderr, "Pluto meldet ungueltige Samplerate %lld Hz\n",
+                        actual_rate);
+                close();
+                return false;
             }
-            if (n == 0) break;
-            got += (size_t)n;
+            G.samplerate = static_cast<uint32_t>(actual_rate);
         }
-        got &= ~(size_t)1;
+        if (G.pluto_bandwidth &&
+            iio_channel_attr_write_longlong(
+                phy_rx, "rf_bandwidth", G.pluto_bandwidth
+            ) < 0) {
+            fprintf(stderr, "Pluto: RF-Bandbreite nicht setzbar\n");
+            close();
+            return false;
+        }
+        if (G.pluto_gain_set &&
+            iio_channel_attr_write_double(
+                phy_rx, "hardwaregain", G.pluto_gain
+            ) < 0) {
+            fprintf(stderr, "Pluto: Hardware-Gain nicht setzbar\n");
+            close();
+            return false;
+        }
+        iio_channel_enable(cap_i);
+        iio_channel_enable(cap_q);
+        const size_t samples = std::max<size_t>(
+            1, G.data_len / sampleBytes(InputFormat::SC16)
+        );
+        buffer_ = iio_device_create_buffer(capture_, samples, false);
+        if (!buffer_) {
+            fprintf(stderr, "Pluto: IIO-Puffer konnte nicht erzeugt werden\n");
+            close();
+            return false;
+        }
+        return true;
+    }
 
-        pthread_mutex_lock(&G.mutex);
-        while (G.data_ready && !g_exit)
-            pthread_cond_wait(&G.cond, &G.mutex);
-        if (got > 0) {
-            memcpy(G.iq_buf.data(), tmp.data(), got);
-            G.iq_len = (uint32_t)got;
-            G.data_ready = true;
+    ReadStatus read_block(SampleBlock& out) override {
+        const ssize_t bytes = iio_buffer_refill(buffer_);
+        if (bytes < 0) {
+            fprintf(stderr, "Pluto: Puffer lesen fehlgeschlagen (%zd)\n", bytes);
+            return g_exit ? ReadStatus::EOF_REACHED : ReadStatus::ERROR;
         }
-        bool eof = io_error || got < tmp.size();
-        if (io_error) G.reader_error = true;
-        if (eof) G.reader_done = true;
-        pthread_cond_broadcast(&G.cond);
-        pthread_mutex_unlock(&G.mutex);
-        if (eof) break;
+        const uint8_t* begin = static_cast<const uint8_t*>(
+            iio_buffer_start(buffer_)
+        );
+        out.format = InputFormat::SC16;
+        out.sample_rate = G.samplerate;
+        const size_t valid_bytes =
+            static_cast<size_t>(bytes) &
+            ~(sampleBytes(InputFormat::SC16) - 1);
+        out.raw.assign(begin, begin + valid_bytes);
+        prepareSampleBlock(out);
+        return bytes > 0 ? ReadStatus::DATA : ReadStatus::EOF_REACHED;
     }
-    if (G.fd >= 0) {
-        close(G.fd);
-        G.fd = -1;
+
+    double sample_rate() const override { return G.samplerate; }
+    bool live() const override { return true; }
+
+    void cancel() override {
+        if (buffer_) iio_buffer_cancel(buffer_);
     }
-}
+
+    void close() override {
+        if (buffer_) iio_buffer_destroy(buffer_);
+        if (context_) iio_context_destroy(context_);
+        buffer_ = nullptr;
+        context_ = nullptr;
+    }
+
+private:
+    struct iio_context* context_ = nullptr;
+    struct iio_device* phy_ = nullptr;
+    struct iio_device* capture_ = nullptr;
+    struct iio_buffer* buffer_ = nullptr;
+};
+#endif
 
 // ---------- Reader-Thread ----------
 static void *readerThread(void *) {
-    if (G.filename) {
-        readFile();
-    } else {
-        int r = rtlsdr_read_async(G.dev, rtlsdrCallback, nullptr, 0, G.data_len);
-        if (r < 0 && !g_exit) {
-            fprintf(stderr, "Fehler: rtlsdr_read_async() lieferte %d\n", r);
-            pthread_mutex_lock(&G.mutex);
-            G.reader_error = true;
-            pthread_mutex_unlock(&G.mutex);
-        }
+    SampleBlock block;
+    block.raw.reserve(G.data_len);
+    while (!g_exit) {
+        const ReadStatus status = G.source->read_block(block);
         pthread_mutex_lock(&G.mutex);
-        G.reader_done = true;
+        if (G.source->live() && status == ReadStatus::DATA && G.data_ready) {
+            ++G.dropped;
+        } else {
+            while (G.data_ready && !g_exit)
+                pthread_cond_wait(&G.cond, &G.mutex);
+        }
+        if (status == ReadStatus::DATA && !g_exit &&
+            (!G.source->live() || !G.data_ready)) {
+            G.iq_buf.raw.swap(block.raw);
+            G.iq_buf.magnitude.swap(block.magnitude);
+            G.iq_buf.format = block.format;
+            G.iq_buf.sample_rate = block.sample_rate;
+            G.data_ready = true;
+        } else {
+            if (status != ReadStatus::DATA) {
+                G.reader_error = status == ReadStatus::ERROR;
+                G.reader_done = true;
+            }
+        }
         pthread_cond_broadcast(&G.cond);
         pthread_mutex_unlock(&G.mutex);
+        if (status != ReadStatus::DATA) break;
     }
     return nullptr;
 }
@@ -2160,11 +2507,20 @@ static void showHelp() {
 "Verwendung: dump1030 [Optionen]\n"
 "Eingabe:\n"
 "  --device <n>            RTL-SDR-Geraeteindex (Default 0)\n"
-"  --file <pfad>           Rohdatei (8-Bit-I/Q) statt RTL-SDR\n"
+"  --input <pfad|->        Datei oder stdin statt RTL-SDR\n"
+"  --file <pfad>           Kompatibilitaetsalias fuer --input\n"
+"  --format <cu8|sc16>     Eingangsformat fuer Datei/stdin (Default cu8)\n"
+"  --sc16-scale <n>        Vollaussteuerung des SC16-Eingangs (Default 2048)\n"
+"  --pluto                  PlutoSDR direkt ueber libiio verwenden\n"
+"  --pluto-uri <uri>        Pluto-URI (Default ip:192.168.2.1)\n"
+"  --pluto-bandwidth <Hz>   Pluto-RX-Bandbreite\n"
+"  --pluto-gain <dB>        Pluto-Hardware-Gain, manueller Modus\n"
 "  --gain <dB|auto|max>    Tuner-Gain in dB (Default max)\n"
-"  --samplerate <r>        2.4..30 MS/s oder Hz (Default 2.5). Bei --file:\n"
+"  --samplerate <r>        2.0..30 MS/s oder Hz (Default 2.5). Bei Datei:\n"
 "                          MUSS der Rate der Aufzeichnung entsprechen!\n"
 "                          --chan muss zur Trainingsrate passen.\n"
+"  --sample-rate <Hz>      Alias fuer --samplerate\n"
+"  --freq <Hz>             Empfangsfrequenz (Default 1030 MHz)\n"
 "  --ppm <-200..200>       Frequenzkorrektur des Tuners in ppm\n"
 "  --agc                   RTL2832-AGC aktivieren\n"
 "  --size <bytes>          Blockgroesse, Vielfaches von 16384, min. 16384\n"
@@ -2180,8 +2536,8 @@ static void showHelp() {
 "  --mnf <0..255>          Max. Noise Floor (fern)\n"
 "  --mnfc <0..255>         Max. Noise Floor (direkt neben Puls)\n"
 "Ausgabe:\n"
-"  --out-dir <pfad>        Ausgabeverzeichnis fuer JSONL/cu8 Dateien\n"
-"  --save-iq               IQ-Daten (im cu8 Format) speichern\n"
+"  --out-dir <pfad>        Ausgabeverzeichnis fuer JSONL/Roh-I/Q\n"
+"  --save-iq               IQ-Daten im Eingangsformat speichern\n"
 "  --p6-diagnostics        Abgelehnte P6-Kandidaten als JSONL ausgeben\n"
 "  --p6-quality <0..255>   Minimale Viterbi-Qualitaet (Default 180)\n"
 "  --p6-coverage <0..1>    Minimale P6-Huellkurvenabdeckung (Default 0.65)\n"
@@ -2238,8 +2594,36 @@ static void parseArgs(int argc, char **argv) {
         const char *a = argv[i];
         if (!strcmp(a, "--device")) {
             G.dev_index = (int)parseLong(a, needArg(argc, argv, i), 0, 255);
-        } else if (!strcmp(a, "--file")) {
-            G.filename = needArg(argc, argv, i);
+        } else if (!strcmp(a, "--file") || !strcmp(a, "--input")) {
+            G.input_name = needArg(argc, argv, i);
+            G.filename = G.input_name.c_str();
+        } else if (!strcmp(a, "--format")) {
+            const char* format = needArg(argc, argv, i);
+            if (!strcmp(format, "cu8")) G.input_format = InputFormat::CU8;
+            else if (!strcmp(format, "sc16"))
+                G.input_format = InputFormat::SC16;
+            else die("--format erwartet cu8 oder sc16");
+            G.input_format_set = true;
+        } else if (!strcmp(a, "--sc16-scale")) {
+            G.sc16_scale = parseFloat(
+                a, needArg(argc, argv, i), 1.0, 32768.0
+            );
+        } else if (!strcmp(a, "--pluto")) {
+            G.use_pluto = true;
+        } else if (!strcmp(a, "--pluto-uri")) {
+            G.pluto_uri = needArg(argc, argv, i);
+            G.use_pluto = true;
+        } else if (!strcmp(a, "--pluto-bandwidth")) {
+            G.pluto_bandwidth = static_cast<uint32_t>(parseLong(
+                a, needArg(argc, argv, i), 1, 100'000'000
+            ));
+            G.use_pluto = true;
+        } else if (!strcmp(a, "--pluto-gain")) {
+            G.pluto_gain = parseFloat(
+                a, needArg(argc, argv, i), -10.0, 73.0
+            );
+            G.pluto_gain_set = true;
+            G.use_pluto = true;
         } else if (!strcmp(a, "--chan")) {
             g_haveChan = loadDpskChannel(needArg(argc, argv, i), g_chan);
             if (g_haveChan) uplinkAddrSelftest();
@@ -2248,7 +2632,8 @@ static void parseArgs(int argc, char **argv) {
             if (!strcmp(v, "auto"))     G.gain = AUTO_GAIN;
             else if (!strcmp(v, "max")) G.gain = MAX_GAIN;
             else G.gain = (int)lround(parseFloat(a, v, 0.0, 60.0) * 10.0);
-        } else if (!strcmp(a, "--samplerate")) {
+        } else if (!strcmp(a, "--samplerate") ||
+                   !strcmp(a, "--sample-rate")) {
             const char *v = needArg(argc, argv, i);
             double r = parseFloat(a, v, 0.0, 31.0e6);
             if (r < 100.0) r *= 1e6;
@@ -2260,6 +2645,10 @@ static void parseArgs(int argc, char **argv) {
                 exit(1);
             }
             G.samplerate = rate;
+        } else if (!strcmp(a, "--freq")) {
+            G.freq = static_cast<uint32_t>(parseLong(
+                a, needArg(argc, argv, i), 1, UINT32_MAX
+            ));
         } else if (!strcmp(a, "--ppm")) {
             G.ppm = (int)parseLong(a, needArg(argc, argv, i), -200, 200);
         } else if (!strcmp(a, "--uplink-decode")) {
@@ -2337,6 +2726,13 @@ static void parseArgs(int argc, char **argv) {
         die("--p6-diagnostics benoetigt --out-dir");
     if (G.p6_diagnostics && !G.uplink_decode)
         die("--p6-diagnostics benoetigt --uplink-decode");
+    if (G.use_pluto && !G.input_name.empty())
+        die("--pluto und --input sind nicht kombinierbar");
+    if (G.use_pluto) {
+        if (G.input_format_set && G.input_format != InputFormat::SC16)
+            die("--pluto benoetigt --format sc16");
+        G.input_format = InputFormat::SC16;
+    }
 }
 
 // ---------- Verarbeitung ----------
@@ -2352,7 +2748,7 @@ static uint32_t fetchBlock(bool &last) {
     }
     if (G.data_ready) {
         std::swap(G.iq_buf, G.iq_work);
-        len = G.iq_len;
+        len = static_cast<uint32_t>(G.iq_work.raw.size());
         G.data_ready = false;
         pthread_cond_broadcast(&G.cond);
     }
@@ -2364,15 +2760,17 @@ static uint32_t fetchBlock(bool &last) {
 static uint64_t g_samples = 0;
 
 static void processBlock(uint32_t len, bool last) {
-    if (G.iq_fp && len >= 2) {
-        fwrite(G.iq_work.data(), 1, len & ~(uint32_t)1, G.iq_fp);
+    if (G.iq_fp && len >= sampleBytes(G.input_format)) {
+        fwrite(G.iq_work.raw.data(), 1, G.iq_work.raw.size(), G.iq_fp);
     }
 
-    uint32_t total = computeMagnitude(len, last);
+    static const SampleBlock empty;
+    const SampleBlock& input = len ? G.iq_work : empty;
+    uint32_t total = computeMagnitude(input, last);
     g_valid_samples = total;
     uint32_t consumed = detectBlock(total, last);
     keepOverlap(total, consumed);
-    g_samples += len / 2;
+    g_samples += input.sample_count();
     if (G.continuous) {
         printStats(g_samples);
         if (G.jsonl_fp) fflush(G.jsonl_fp);
@@ -2383,16 +2781,27 @@ static void processBlock(uint32_t len, bool last) {
 // ---------- main ----------
 int main(int argc, char **argv) {
     parseArgs(argc, argv);
-    if (!G.filename) {
-        initRtlsdr();
+    if (G.use_pluto) {
+#if WITH_PLUTO
+        G.source.reset(new PlutoSampleSource());
+#else
+        die("Pluto-Unterstuetzung ist in diesem Build nicht enthalten; "
+            "mit WITH_PLUTO=1 bauen");
+#endif
+    } else if (!G.input_name.empty()) {
+        G.source.reset(new FileSampleSource(
+            G.input_name, G.input_format, G.data_len, G.samplerate
+        ));
     } else {
-        G.fd = open(G.filename, O_RDONLY);
-        if (G.fd < 0) {
-            fprintf(stderr, "Fehler: Datei '%s' nicht lesbar: %s\n",
-                    G.filename, strerror(errno));
-            return 1;
-        }
+#if WITH_RTLSDR
+        G.input_format = InputFormat::CU8;
+        G.source.reset(new RtlSampleSource());
+#else
+        die("Kein Eingangs-Backend verfuegbar; --input verwenden oder "
+            "mit WITH_RTLSDR=1 bauen");
+#endif
     }
+    if (!G.source->open()) return 1;
     G.tm.init(G.samplerate);
     if (g_haveChan) {
         const double rate_error = std::abs(
@@ -2403,14 +2812,12 @@ int main(int argc, char **argv) {
                     "Kanaldatei wurde bei %u Hz trainiert; "
                     "Eingangsrate ist %u Hz\n",
                     g_chan.input_sample_rate, G.samplerate);
-            if (G.dev) { rtlsdr_close(G.dev); G.dev = nullptr; }
-            if (G.fd >= 0) { close(G.fd); G.fd = -1; }
+            G.source->close();
             return 1;
         }
     }
     if (!initOutputs()) {
-        if (G.dev) { rtlsdr_close(G.dev); G.dev = nullptr; }
-        if (G.fd >= 0) { close(G.fd); G.fd = -1; }
+        G.source->close();
         return 1;
     }
     buildLut();
@@ -2420,11 +2827,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Hinweis: --uplink-decode ist experimentell und nicht "
                         "validiert (Quality-Gates in JSONL beachten)\n");
 
-    G.iq_buf.resize(G.data_len);
-    G.iq_work.resize(G.data_len);
-    G.mag.resize((size_t)G.data_len / 2 + 2 * (size_t)G.lookahead);
-    G.iq_hist.resize(
-        2 * ((size_t)G.data_len / 2 + 2 * (size_t)G.lookahead)
+    const size_t max_samples =
+        (size_t)G.data_len / sampleBytes(G.input_format);
+    G.mag.resize(max_samples + 2 * (size_t)G.lookahead);
+    G.iq_hist.format = G.input_format;
+    G.iq_hist.sample_rate = G.samplerate;
+    G.iq_hist.raw.resize(
+        sampleBytes(G.input_format) *
+        (max_samples + 2 * (size_t)G.lookahead)
     );
 
     struct sigaction sa{};
@@ -2436,13 +2846,13 @@ int main(int argc, char **argv) {
 
     if (pthread_create(&G.reader_thread, nullptr, readerThread, nullptr) != 0) {
         fprintf(stderr, "Fehler: Reader-Thread konnte nicht gestartet werden\n");
-        if (G.dev) { rtlsdr_close(G.dev); G.dev = nullptr; }
-        if (G.fd >= 0) { close(G.fd); G.fd = -1; }
+        G.source->close();
         closeOutputs();
         return 1;
     }
 
-    const bool single = !G.filename && !G.continuous;
+    const bool single =
+        !G.use_pluto && G.input_name.empty() && !G.continuous;
     while (!g_exit) {
         bool last = false;
         uint32_t len = fetchBlock(last);
@@ -2468,16 +2878,17 @@ int main(int argc, char **argv) {
 
     // ---------- Aufraeumen ----------
     g_exit = true;
-    if (G.dev) rtlsdr_cancel_async(G.dev);
+    if (G.source) G.source->cancel();
     pthread_mutex_lock(&G.mutex);
     pthread_cond_broadcast(&G.cond);
     pthread_mutex_unlock(&G.mutex);
     pthread_join(G.reader_thread, nullptr);
 
-    if (G.dev) { rtlsdr_close(G.dev); G.dev = nullptr; }
-    if (G.fd >= 0) { close(G.fd); G.fd = -1; }
+    G.source->close();
     closeOutputs();
     pthread_cond_destroy(&G.cond);
     pthread_mutex_destroy(&G.mutex);
-    return G.reader_error ? 1 : 0;
+    const int signal_number = g_signal.load();
+    return signal_number ? 128 + signal_number
+                         : (G.reader_error ? 1 : 0);
 }

@@ -2,7 +2,8 @@
 """p6sim.py - synthetische P6-Uplinks mit bekannten Bits (nur Standardbibliothek)
 
 Erzeugen:
-  p6sim.py gen -o sim.bin [--sample-rate 2500000] [--count 2000]
+  p6sim.py gen -o sim.bin [--sample-rate 2500000] [--format cu8|sc16]
+                          [--count 2000]
                           [--snr 25] [--bw 1.0] [--df -6.4]
                           [--len 56|112|mix] [--amp 50] [--gap 500]
                           [--drop-ppm 0] [--seed 1]
@@ -14,7 +15,7 @@ Kanal: ideales DPSK @20 MS/s -> FIR-Tiefpass (--bw, MHz einseitig)
        -> Frequenzversatz (--df, kHz) -> Rauschen -> 8-Bit-Quantisierung
        -> optional Sample-Drops (Blöcke à 256 I/Q-Paare)
 """
-import argparse, cmath, collections, math, random, re, sys, time
+import argparse, cmath, collections, math, random, re, struct, sys, time
 
 FS_HI = 20e6
 FS = 2.5e6
@@ -114,15 +115,24 @@ def gen(a):
             dropped += 1
             continue
         for v in samples[s:s + DROP_BLK]:
-            out.append(min(255, max(0, int(round(127.5 + v.real)))))
-            out.append(min(255, max(0, int(round(127.5 + v.imag)))))
+            if a.format == 'cu8':
+                out.append(min(255, max(0, int(round(127.5 + v.real)))))
+                out.append(min(255, max(0, int(round(127.5 + v.imag)))))
+            else:
+                scale = a.sc16_scale / 127.5
+                out.extend(struct.pack(
+                    '<hh',
+                    max(-32768, min(32767, int(round(v.real * scale)))),
+                    max(-32768, min(32767, int(round(v.imag * scale)))),
+                ))
 
     with open(a.o, 'wb') as fo:
         fo.write(out)
     tname = re.sub(r'\.bin$', '', a.o) + '.truth'
     with open(tname, 'w') as ft:
         ft.write(f"# snr={a.snr} bw={a.bw} df={a.df} amp={a.amp} "
-                 f"drop_ppm={a.drop_ppm} seed={a.seed} fs={sample_rate}\n")
+                 f"drop_ppm={a.drop_ppm} seed={a.seed} fs={sample_rate} "
+                 f"format={a.format}\n")
         for idx, n, hx in truth:
             ft.write(f"{idx:.3f} {n} {hx}\n")
     print(f"{a.o}: {g / sample_rate:.2f} s, "
@@ -761,10 +771,11 @@ def rt_window_params(sample_rate):
     return prefix, window
 
 def rt_detect(data, nmax, thr_fac, sample_rate):
-    """P1/P2/P6-Detektor auf uint8-I/Q, liefert (Liste der P1-Samples, Schwelle)"""
-    sq = [(i - 127.5) ** 2 for i in range(256)]
-    ns = min(len(data) // 2, nmax)
-    probe = sorted(sq[data[2 * j]] + sq[data[2 * j + 1]] for j in range(0, min(ns, 1000000), 97))
+    """P1/P2/P6-Detektor; liefert P1-Indizes und Leistungsschwelle."""
+    ns = min(len(data), nmax)
+    probe = sorted(abs(data[j]) ** 2 for j in range(
+        0, min(ns, 1000000), 97
+    ))
     thr = probe[len(probe) // 2] * thr_fac
     def samples(us):
         return max(1, int(round(us * sample_rate / 1e6)))
@@ -782,7 +793,7 @@ def rt_detect(data, nmax, thr_fac, sample_rate):
     hits, CH, k0, nxt = [], 1000000, 0, 0
     while k0 < ns - guard:
         k1 = min(ns, k0 + CH + guard)
-        m = [sq[data[2 * j]] + sq[data[2 * j + 1]] for j in range(k0, k1)]
+        m = [abs(data[j]) ** 2 for j in range(k0, k1)]
         for i in range(p1_in, len(m) - p6_stop - 1):
             if m[i] <= thr or k0 + i < nxt:
                 continue
@@ -810,10 +821,7 @@ def rt_frame(data, k, thr, sample_rate):
     """Fenster ab 8 µs vor P1, Länge per Energie bei 23-27 µs, df per Frame"""
     prefix, window = rt_window_params(sample_rate)
     s0 = k - prefix
-    r = [
-        complex(data[2 * j] - 127.5, data[2 * j + 1] - 127.5)
-        for j in range(s0, s0 + window)
-    ]
+    r = data[s0:s0 + window]
     energy_start = prefix + int(round(23.0 * sample_rate / 1e6))
     energy_stop = min(len(r), prefix + int(round(27.0 * sample_rate / 1e6)) + 1)
     e = sum(
@@ -856,10 +864,31 @@ def rt_stats(label, rows):
     print('    Laeufe ' + '  '.join('%d: %4.1f %%' % (l, 100.0 * runs[l] / tr) for l in sorted(runs)[:5])
           + '   (soll 50/25/12,5)')
 
+def rt_read_samples(path, sample_format, sc16_scale):
+    if sample_format == 'cu8':
+        with open(path, 'rb') as fi:
+            raw = fi.read()
+        if len(raw) % 2:
+            raise SystemExit('CU8-Dateigroesse ist kein Vielfaches von 2 Bytes.')
+        return [
+            complex(
+                (raw[index] - 127.5) / 127.5,
+                (raw[index + 1] - 127.5) / 127.5,
+            )
+            for index in range(0, len(raw), 2)
+        ]
+    with open(path, 'rb') as fi:
+        raw = fi.read()
+    if len(raw) % 4:
+        raise SystemExit('SC16-Dateigroesse ist kein Vielfaches von 4 Bytes.')
+    samples = []
+    for i, q in struct.iter_unpack('<hh', raw):
+        samples.append(complex(i / sc16_scale, q / sc16_scale))
+    return samples
+
 def cmd_realtest(args):
     t0 = time.time()
-    with open(args.file, 'rb') as fi:
-        data = fi.read()
+    data = rt_read_samples(args.file, args.format, args.sc16_scale)
     if not data:
         raise SystemExit('Keine IQ-Daten in der Eingabedatei; Abbruch.')
     sample_rate = args.sample_rate
@@ -871,7 +900,7 @@ def cmd_realtest(args):
     frame_origin = ST_PAD - prefix * model_ticks_per_input_sample(sample_rate)
     for k in hits:
         s0 = k - prefix
-        if s0 >= 0 and 2 * (s0 + window) <= len(data):
+        if s0 >= 0 and s0 + window <= len(data):
             r, n, df = rt_frame(data, k, thr, sample_rate)
             frames.append((k, r, n, df))
     dfs = sorted(f[3] for f in frames)
@@ -960,7 +989,7 @@ ap = argparse.ArgumentParser(description="P6-Simulator für dump1030")
 sub = ap.add_subparsers(dest='cmd', required=True)
 
 g = sub.add_parser('gen', help="Testdatei erzeugen")
-g.add_argument('-o', required=True, help="Ausgabedatei (.bin, uint8 I/Q)")
+g.add_argument('-o', required=True, help="Ausgabedatei (I/Q)")
 g.add_argument('--count', type=int, default=2000, help="Anzahl Frames")
 g.add_argument('--snr', type=float, default=25.0, help="SNR in dB")
 g.add_argument('--bw', type=float, default=1.0, help="Tiefpass-Grenzfrequenz in MHz")
@@ -969,6 +998,12 @@ g.add_argument('--len', choices=('56', '112', 'mix'), default='mix')
 g.add_argument('--amp', type=float, default=50.0, help="Signalamplitude (ADC-Einheiten)")
 g.add_argument('--gap', type=float, default=500.0, help="Abstand der Frames in µs")
 g.add_argument('--sample-rate', type=float, default=FS)
+g.add_argument(
+    '--format', choices=('cu8', 'sc16'), default='cu8',
+    help="Ausgangsformat; SC16 ist little-endian int16 I/Q",
+)
+g.add_argument('--sc16-scale', type=float, default=2048.0,
+               help="SC16-Vollaussteuerung")
 g.add_argument('--drop-ppm', type=float, default=0.0,
                help="Sample-Drops (z.B. 1850 wie gemessen)")
 g.add_argument('--seed', type=int, default=1)
@@ -996,6 +1031,11 @@ p_rt = sub.add_parser('realtest', help="Echte IQ-Datei dekodieren")
 p_rt.add_argument('file')
 p_rt.add_argument('--max-sec', type=float, default=30.0)
 p_rt.add_argument('--sample-rate', type=float, default=FS)
+p_rt.add_argument(
+    '--format', choices=('cu8', 'sc16'), default='cu8',
+    help="Eingangsformat; SC16 ist little-endian int16 I/Q",
+)
+p_rt.add_argument('--sc16-scale', type=float, default=2048.0)
 p_rt.add_argument('--thr', type=float, default=10.0)
 p_rt.add_argument('--train', type=int, default=150)
 p_rt.add_argument(
@@ -1014,4 +1054,6 @@ p_rt.add_argument('--chan-out', default='')
 args = ap.parse_args()
 if hasattr(args, 'sample_rate') and args.sample_rate <= 0:
     ap.error('--sample-rate must be positive')
+if hasattr(args, 'sc16_scale') and args.sc16_scale <= 0:
+    ap.error('--sc16-scale must be positive')
 cmd_realtest(args) if args.cmd == 'realtest' else (cmd_selftest(args) if args.cmd == 'selftest' else (gen(args) if args.cmd == 'gen' else compare(args)))
